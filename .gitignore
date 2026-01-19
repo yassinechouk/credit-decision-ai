@@ -1,0 +1,29 @@
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Node/Frontend
+node_modules/
+dist/
+build/
+
+# Editors
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Docker artifacts
+*.pid
+
+# Keep .env tracked (team-shared), ignore variants
+*.env.local
+.env.development
+.env.production
