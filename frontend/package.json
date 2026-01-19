@@ -1,0 +1,12 @@
+{
+  "name": "credit-decision-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "serve -l 4173 src"
+  },
+  "dependencies": {
+    "serve": "^14.2.1"
+  }
+}
