@@ -268,7 +268,7 @@ class SimilarityAgentAI:
         return prompt
     
     def _call_llm(self, prompt:  str) -> Dict[str, Any]:
-        if not self.llm_enabled:
+        if not self.llm_enabled or self.llm_client is None:
             return self._fallback()
         
         try:
