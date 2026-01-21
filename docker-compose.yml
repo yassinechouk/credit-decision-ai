@@ -1,4 +1,15 @@
 services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: credit
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
   backend:
     build: ./backend
     ports:
@@ -8,6 +19,7 @@ services:
     env_file:
       - .env
     depends_on:
+      - postgres
       - qdrant
 
   qdrant:
@@ -27,3 +39,4 @@ services:
 
 volumes:
   frontend_node_modules:
+  postgres_data:
