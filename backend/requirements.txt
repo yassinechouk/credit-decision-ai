@@ -3,6 +3,7 @@ uvicorn
 pydantic
 qdrant-client
 sentence-transformers
+torch==2.3.1
 langchain
 python-multipart
-openai>=1.0.0openai>=1.0.0
+openai>=1.0.0
