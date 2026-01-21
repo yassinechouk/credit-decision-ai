@@ -1,6 +1,0 @@
-{
-  "case_id": "CASE_001",
-  "monthly_income": 2000,
-  "requested_amount": 5000,
-  "documents": ["invoice_001.pdf"]
-}
