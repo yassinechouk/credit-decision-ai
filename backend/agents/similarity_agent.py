@@ -1,29 +1,14 @@
 """
-==============================================================================
-SIMILARITY AGENT - Agent de Recherche de Similarité pour Décision de Crédit
-==============================================================================
-
-Cet agent compare un nouveau dossier de crédit avec les cas historiques 
-stockés dans Qdrant pour évaluer le risque basé sur des profils similaires. 
-
-FONCTIONNEMENT: 
-1. Reçoit un profil de crédit (nouveau dossier)
-2. Convertit le profil en texte descriptif
-3. Génère un embedding (vecteur numérique) du texte
-4. Recherche les K cas les plus similaires dans Qdrant
-5. Analyse les résultats (défauts, fraudes, patterns)
-6. Retourne une évaluation du risque avec insights
-
-AUTEUR:  Équipe Credit Decision AI
-DATE:  Janvier 2026
+SIMILARITY AGENT AI - Agent Intelligent pour Décision de Crédit
 """
 
 import os
+import json
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 from sentence_transformers import SentenceTransformer
+from openai import OpenAI
 
 
 # ==============================================================================
@@ -34,33 +19,43 @@ QDRANT_URL = os. getenv(
     "QDRANT_URL", 
     "https://44775a69-b58f-449f-b5ca-b0f6ec6b5862.europe-west3-0.gcp.cloud.qdrant.io:6333"
 )
-QDRANT_API_KEY = os.getenv(
+QDRANT_API_KEY = os. getenv(
     "QDRANT_API_KEY",
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.51Eobf7Ye3tWtM_4YRPqCtAAvPXIssDAJbgm3KHx9ic"
 )
-
 COLLECTION_NAME = "credit_dataset"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-TOP_K_SIMILAR = int(os.getenv("TOP_K_SIMILAR", "10"))
+TOP_K_SIMILAR = 20
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.groq.com/openai/v1")
+LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.1-70b-versatile")
 
 
 # ==============================================================================
-# CLASSE DE DONNÉES :  Représentation d'un Dossier de Crédit
+# PROMPTS
+# ==============================================================================
+
+SYSTEM_PROMPT = """Tu es un expert analyste credit senior avec 20 ans d'experience.
+Tu analyses les demandes de credit en comparant avec des cas historiques.
+Tu dois fournir une analyse objective et explicable. 
+Reponds TOUJOURS en JSON valide."""
+
+
+# ==============================================================================
+# CREDIT PROFILE
 # ==============================================================================
 
 @dataclass
 class CreditProfile:
-    """
-    Représente un profil de demande de crédit. 
-    """
     loan_amount: float
     loan_duration: int
-    monthly_income: float
+    monthly_income:  float
     other_income: float
     monthly_charges: float
-    employment_type: str
+    employment_type:  str
     contract_type: str
-    seniority_years: int
+    seniority_years:  int
     marital_status: str
     number_of_children: int
     spouse_employed: Optional[bool]
@@ -68,435 +63,412 @@ class CreditProfile:
     is_primary_holder: bool
     
     def to_text(self) -> str:
-        """
-        Convertit le profil en texte descriptif pour l'embedding.
-        """
-        if self.spouse_employed is True:
-            spouse_status = "conjoint employé"
-        elif self.spouse_employed is False:
-            spouse_status = "conjoint non employé"
-        else:
-            spouse_status = "célibataire ou information non disponible"
-        
         total_income = self.monthly_income + (self.other_income or 0)
-        debt_ratio = (self.monthly_charges / total_income * 100) if total_income > 0 else 0
+        return f"""
+        Demande de pret:  {self.loan_amount} euros sur {self.loan_duration} mois
+        Revenus:  {total_income} euros, Charges: {self.monthly_charges} euros
+        Emploi: {self.employment_type} ({self.contract_type}), {self.seniority_years} ans
+        Situation:  {self.marital_status}, {self.number_of_children} enfants
+        Logement: {self.housing_status}
+        """.strip()
+    
+    def to_dict(self) -> Dict[str, Any]:
+        total_income = self.monthly_income + (self.other_income or 0)
+        monthly_payment = self.loan_amount / self.loan_duration if self.loan_duration > 0 else 0
+        current_debt_ratio = (self.monthly_charges / total_income * 100) if total_income > 0 else 0
+        projected_debt_ratio = ((self.monthly_charges + monthly_payment) / total_income * 100) if total_income > 0 else 0
         
-        text = f"""
-        Demande de prêt: 
-        - Montant demandé: {self.loan_amount}€ sur {self.loan_duration} mois
-        - Revenu mensuel: {self.monthly_income}€
-        - Autres revenus: {self.other_income}€
-        - Revenu total: {total_income}€
-        - Charges mensuelles: {self.monthly_charges}€
-        - Ratio d'endettement: {debt_ratio:.1f}%
-        - Type d'emploi: {self. employment_type}
-        - Type de contrat: {self.contract_type}
-        - Ancienneté: {self.seniority_years} ans
-        - Statut marital: {self.marital_status}
-        - Nombre d'enfants: {self.number_of_children}
-        - Situation conjoint: {spouse_status}
-        - Statut logement: {self.housing_status}
-        - Titulaire principal: {'oui' if self.is_primary_holder else 'non'}
-        """
-        return text. strip()
+        return {
+            "loan_amount": self.loan_amount,
+            "loan_duration":  self.loan_duration,
+            "monthly_payment": round(monthly_payment, 2),
+            "monthly_income": self.monthly_income,
+            "other_income": self.other_income,
+            "total_income": total_income,
+            "monthly_charges": self. monthly_charges,
+            "current_debt_ratio": round(current_debt_ratio, 2),
+            "projected_debt_ratio": round(projected_debt_ratio, 2),
+            "employment_type": self.employment_type,
+            "contract_type": self.contract_type,
+            "seniority_years": self.seniority_years,
+            "marital_status": self.marital_status,
+            "number_of_children": self.number_of_children,
+            "spouse_employed":  self.spouse_employed,
+            "housing_status": self.housing_status,
+            "is_primary_holder": self.is_primary_holder
+        }
     
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'CreditProfile':
-        """Crée un CreditProfile à partir d'un dictionnaire."""
+    def from_dict(cls, data: Dict[str, Any]) -> "CreditProfile":
         return cls(
-            loan_amount=data.get('loan_amount', 0),
-            loan_duration=data.get('loan_duration', 0),
-            monthly_income=data. get('monthly_income', 0),
-            other_income=data.get('other_income', 0),
-            monthly_charges=data.get('monthly_charges', 0),
-            employment_type=data.get('employment_type', 'unknown'),
-            contract_type=data.get('contract_type', 'unknown'),
-            seniority_years=data.get('seniority_years', 0),
-            marital_status=data.get('marital_status', 'unknown'),
-            number_of_children=data.get('number_of_children', 0),
-            spouse_employed=data.get('spouse_employed'),
-            housing_status=data. get('housing_status', 'unknown'),
-            is_primary_holder=data.get('is_primary_holder', True)
+            loan_amount=data. get("loan_amount", 0),
+            loan_duration=data.get("loan_duration", 0),
+            monthly_income=data.get("monthly_income", 0),
+            other_income=data.get("other_income", 0),
+            monthly_charges=data.get("monthly_charges", 0),
+            employment_type=data.get("employment_type", "unknown"),
+            contract_type=data.get("contract_type", "unknown"),
+            seniority_years=data.get("seniority_years", 0),
+            marital_status=data. get("marital_status", "unknown"),
+            number_of_children=data.get("number_of_children", 0),
+            spouse_employed=data.get("spouse_employed"),
+            housing_status=data.get("housing_status", "unknown"),
+            is_primary_holder=data. get("is_primary_holder", True)
         )
 
 
 # ==============================================================================
-# CLASSE PRINCIPALE :  Similarity Agent
+# SIMILARITY AGENT AI
 # ==============================================================================
 
-class SimilarityAgent:
-    """
-    Agent de recherche de similarité pour l'évaluation de risque de crédit.
-    """
+class SimilarityAgentAI:
     
     def __init__(self):
-        """Initialise l'agent avec les connexions nécessaires."""
-        print("🔄 Initialisation du Similarity Agent...")
+        print("Initialisation du Similarity Agent AI...")
+        print("=" * 60)
         
-        # Connexion à Qdrant
-        self.qdrant_client = QdrantClient(
-            url=QDRANT_URL,
-            api_key=QDRANT_API_KEY
-        )
-        print(f"✅ Connecté à Qdrant: {QDRANT_URL}")
+        self. qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+        print("Qdrant connecte:  " + QDRANT_URL[: 50] + "...")
         
-        # Chargement du modèle d'embedding
         self.embedding_model = SentenceTransformer(EMBEDDING_MODEL)
-        print(f"✅ Modèle d'embedding chargé:  {EMBEDDING_MODEL}")
+        print("Modele d'embedding: " + EMBEDDING_MODEL)
+        
+        if OPENAI_API_KEY: 
+            self.llm_client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+            self.llm_enabled = True
+            print("LLM connecte: " + LLM_MODEL)
+        else:
+            self.llm_client = None
+            self.llm_enabled = False
+            print("LLM non configure (OPENAI_API_KEY manquant)")
         
         self.collection_name = COLLECTION_NAME
         self.top_k = TOP_K_SIMILAR
         
-        print("✅ Similarity Agent initialisé avec succès!")
+        print("=" * 60)
+        print("Similarity Agent AI initialise avec succes!")
     
     def _create_embedding(self, text: str) -> List[float]:
-        """Génère un embedding à partir d'un texte."""
-        embedding = self.embedding_model.encode(text)
-        return embedding. tolist()
+        return self.embedding_model.encode(text).tolist()
     
-    def _search_similar_cases(
-        self, 
-        query_vector: List[float],
-        top_k: int = None,
-        filter_conditions: Dict[str, Any] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Recherche les cas similaires dans Qdrant. 
-        
-        CORRECTION:  Utilise query_points() au lieu de search() pour les versions récentes de qdrant-client
-        """
-        if top_k is None:
-            top_k = self.top_k
-        
-        # Construire le filtre si spécifié
-        query_filter = None
-        if filter_conditions: 
-            conditions = []
-            for key, value in filter_conditions.items():
-                conditions.append(
-                    FieldCondition(
-                        key=key,
-                        match=MatchValue(value=value)
-                    )
-                )
-            query_filter = Filter(must=conditions)
-        
-        # ============================================================
-        # CORRECTION : Utiliser query_points au lieu de search
-        # ============================================================
+    def _search_similar_cases(self, query_vector: List[float]) -> List[Dict[str, Any]]: 
         try:
-            # Nouvelle API (qdrant-client >= 1.7.0)
-            from qdrant_client.http.models import QueryRequest
-            
             results = self.qdrant_client.query_points(
                 collection_name=self.collection_name,
                 query=query_vector,
-                query_filter=query_filter,
-                limit=top_k,
+                limit=self.top_k,
                 with_payload=True
             )
-            # Extraire les points du résultat
-            points = results.points if hasattr(results, 'points') else results
-            
-        except (ImportError, AttributeError, TypeError):
-            # Ancienne API (fallback) - essayer search
-            try:
-                results = self.qdrant_client.search(
-                    collection_name=self.collection_name,
-                    query_vector=query_vector,
-                    query_filter=query_filter,
-                    limit=top_k,
-                    with_payload=True
-                )
-                points = results
-            except AttributeError:
-                # Dernier recours:  utiliser la méthode REST directe
-                points = self._search_via_rest(query_vector, top_k, query_filter)
+            points = results.points if hasattr(results, "points") else results
+        except Exception as e:
+            print("Erreur Qdrant: " + str(e))
+            points = []
         
-        # Formater les résultats
         similar_cases = []
         for result in points:
+            payload = result.payload if hasattr(result, "payload") else result. get("payload", {})
+            score = result.score if hasattr(result, "score") else result.get("score", 0)
             similar_cases.append({
-                "case_id": result.payload.get("case_id") if hasattr(result, 'payload') else result.get("payload", {}).get("case_id"),
-                "similarity_score": result.score if hasattr(result, 'score') else result.get("score", 0),
-                "defaulted": result.payload.get("defaulted", False) if hasattr(result, 'payload') else result.get("payload", {}).get("defaulted", False),
-                "fraud_flag": result.payload.get("fraud_flag", False) if hasattr(result, 'payload') else result.get("payload", {}).get("fraud_flag", False),
-                "payload": result.payload if hasattr(result, 'payload') else result.get("payload", {})
+                "case_id": payload.get("case_id"),
+                "similarity_score": score,
+                "defaulted": payload.get("defaulted", False),
+                "fraud_flag": payload.get("fraud_flag", False),
+                "payload": payload
             })
-        
         return similar_cases
     
-    def _search_via_rest(self, query_vector: List[float], top_k: int, query_filter) -> List[Dict]: 
-        """
-        Méthode de secours utilisant l'API REST directement.
-        """
-        import requests
-        
-        url = f"{QDRANT_URL}/collections/{self.collection_name}/points/search"
-        headers = {
-            "Content-Type": "application/json",
-            "api-key": QDRANT_API_KEY
-        }
-        
-        payload = {
-            "vector": query_vector,
-            "limit": top_k,
-            "with_payload": True
-        }
-        
-        if query_filter:
-            payload["filter"] = query_filter. dict() if hasattr(query_filter, 'dict') else query_filter
-        
-        response = requests.post(url, json=payload, headers=headers)
-        
-        if response.status_code == 200:
-            return response.json().get("result", [])
-        else:
-            print(f"❌ Erreur API REST: {response.status_code} - {response.text}")
-            return []
-    
-    def _analyze_similar_cases(self, similar_cases: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Analyse les cas similaires pour extraire des statistiques et insights."""
+    def _compute_statistics(self, similar_cases: List[Dict]) -> Dict[str, Any]:
         if not similar_cases:
             return {
-                "similar_good_profiles": 0,
-                "similar_bad_profiles": 0,
-                "repayment_success_rate": 0.0,
-                "fraud_ratio": 0.0,
-                "confidence":  "low",
-                "dominant_patterns": [],
-                "insight": "Aucun cas similaire trouvé dans l'historique"
+                "total_similar":  0,
+                "good_profiles": 0,
+                "bad_profiles": 0,
+                "fraud_cases": 0,
+                "success_rate": 0,
+                "default_rate": 0,
+                "fraud_rate": 0,
+                "avg_similarity": 0
             }
-        
-        good_profiles = sum(1 for c in similar_cases if not c["defaulted"])
-        bad_profiles = sum(1 for c in similar_cases if c["defaulted"])
-        fraud_cases = sum(1 for c in similar_cases if c["fraud_flag"])
         
         total = len(similar_cases)
-        
-        repayment_success_rate = good_profiles / total if total > 0 else 0
-        fraud_ratio = fraud_cases / total if total > 0 else 0
-        
-        avg_similarity = sum(c["similarity_score"] for c in similar_cases) / total
-        
-        if total >= 10 and avg_similarity >= 0.8:
-            confidence = "high"
-        elif total >= 5 and avg_similarity >= 0.6:
-            confidence = "medium"
-        else:
-            confidence = "low"
-        
-        dominant_patterns = self._identify_patterns(similar_cases)
-        
-        insight = self._generate_insight(
-            good_profiles, bad_profiles, fraud_cases,
-            repayment_success_rate, dominant_patterns
-        )
+        good = sum(1 for c in similar_cases if not c["defaulted"])
+        bad = sum(1 for c in similar_cases if c["defaulted"])
+        fraud = sum(1 for c in similar_cases if c["fraud_flag"])
+        avg_sim = sum(c["similarity_score"] for c in similar_cases) / total
         
         return {
-            "similar_good_profiles": good_profiles,
-            "similar_bad_profiles": bad_profiles,
-            "repayment_success_rate":  round(repayment_success_rate, 2),
-            "fraud_ratio":  round(fraud_ratio, 2),
-            "total_similar_cases": total,
-            "average_similarity": round(avg_similarity, 4),
-            "confidence": confidence,
-            "dominant_patterns": dominant_patterns,
-            "insight":  insight
+            "total_similar": total,
+            "good_profiles": good,
+            "bad_profiles": bad,
+            "fraud_cases":  fraud,
+            "success_rate": good / total,
+            "default_rate": bad / total,
+            "fraud_rate": fraud / total,
+            "avg_similarity":  avg_sim
         }
     
-    def _identify_patterns(self, similar_cases: List[Dict[str, Any]]) -> List[str]:
-        """Identifie les patterns dominants parmi les cas similaires."""
-        patterns = []
+    def _format_cases_for_llm(self, cases: List[Dict]) -> str:
+        if not cases:
+            return "Aucun cas similaire."
         
-        if not similar_cases:
-            return patterns
-        
-        # Analyser les types d'emploi
-        employment_types = [c["payload"].get("employment_type") for c in similar_cases if c["payload"].get("employment_type")]
-        if employment_types:
-            most_common_employment = max(set(employment_types), key=employment_types.count)
-            employment_ratio = employment_types.count(most_common_employment) / len(employment_types)
-            if employment_ratio >= 0.5:
-                patterns.append(f"Majorité {most_common_employment}s ({employment_ratio*100:.0f}%)")
-        
-        # Analyser les types de contrat
-        contract_types = [c["payload"].get("contract_type") for c in similar_cases if c["payload"].get("contract_type")]
-        if contract_types:
-            most_common_contract = max(set(contract_types), key=contract_types. count)
-            contract_ratio = contract_types.count(most_common_contract) / len(contract_types)
-            if contract_ratio >= 0.5:
-                patterns.append(f"Contrat {most_common_contract} dominant ({contract_ratio*100:.0f}%)")
-        
-        # Analyser le statut logement
-        housing_statuses = [c["payload"].get("housing_status") for c in similar_cases if c["payload"].get("housing_status")]
-        if housing_statuses:
-            most_common_housing = max(set(housing_statuses), key=housing_statuses.count)
-            housing_ratio = housing_statuses.count(most_common_housing) / len(housing_statuses)
-            if housing_ratio >= 0.5:
-                patterns.append(f"Logement:  {most_common_housing} ({housing_ratio*100:.0f}%)")
-        
-        return patterns
+        lines = []
+        for i, c in enumerate(cases[: 10], 1):
+            p = c["payload"]
+            status = "DEFAUT" if c["defaulted"] else "OK"
+            fraud = " FRAUDE" if c["fraud_flag"] else ""
+            similarity_pct = int(c["similarity_score"] * 100)
+            loan = p.get("loan_amount", 0)
+            duration = p.get("loan_duration", 0)
+            emp = p.get("employment_type", "? ")
+            contract = p.get("contract_type", "?")
+            lines.append(str(i) + ". [" + str(similarity_pct) + "%] " + status + fraud + " - " + str(loan) + "E/" + str(duration) + "m - " + emp + " (" + contract + ")")
+        return "\n".join(lines)
     
-    def _generate_insight(
-        self,
-        good_profiles: int,
-        bad_profiles: int,
-        fraud_cases: int,
-        success_rate: float,
-        patterns: List[str]
-    ) -> str:
-        """Génère un insight textuel basé sur l'analyse."""
-        total = good_profiles + bad_profiles
+    def _build_prompt(self, profile: Dict, cases: List[Dict], stats: Dict) -> str:
+        cases_text = self._format_cases_for_llm(cases)
+        success_pct = int(stats["success_rate"] * 100)
+        default_pct = int(stats["default_rate"] * 100)
+        fraud_pct = int(stats["fraud_rate"] * 100)
+        similarity_pct = int(stats["avg_similarity"] * 100)
         
-        if total == 0:
-            return "Aucun cas similaire trouvé pour établir une comparaison."
+        prompt = """
+## NOUVEAU DOSSIER: 
+
+- Pret:  """ + str(profile["loan_amount"]) + """E sur """ + str(profile["loan_duration"]) + """ mois (mensualite: """ + str(profile["monthly_payment"]) + """E)
+- Revenus: """ + str(profile["monthly_income"]) + """E/mois + """ + str(profile["other_income"]) + """E autres = """ + str(profile["total_income"]) + """E total
+- Charges: """ + str(profile["monthly_charges"]) + """E/mois
+- Ratio endettement: actuel """ + str(profile["current_debt_ratio"]) + """% - projete """ + str(profile["projected_debt_ratio"]) + """%
+- Emploi: """ + str(profile["employment_type"]) + """ (""" + str(profile["contract_type"]) + """), """ + str(profile["seniority_years"]) + """ ans anciennete
+- Situation: """ + str(profile["marital_status"]) + """, """ + str(profile["number_of_children"]) + """ enfant(s), conjoint employe:  """ + str(profile["spouse_employed"]) + """
+- Logement: """ + str(profile["housing_status"]) + """
+
+## CAS SIMILAIRES (""" + str(stats["total_similar"]) + """ trouves):
+""" + cases_text + """
+
+## STATISTIQUES:
+- Succes: """ + str(stats["good_profiles"]) + """/""" + str(stats["total_similar"]) + """ (""" + str(success_pct) + """%)
+- Defauts: """ + str(stats["bad_profiles"]) + """/""" + str(stats["total_similar"]) + """ (""" + str(default_pct) + """%)
+- Fraudes: """ + str(stats["fraud_cases"]) + """/""" + str(stats["total_similar"]) + """ (""" + str(fraud_pct) + """%)
+- Similarite moyenne: """ + str(similarity_pct) + """%
+
+## REPONDS EN JSON VALIDE: 
+{
+    "recommendation": "APPROUVER ou APPROUVER_AVEC_CONDITIONS ou REVISER ou REFUSER",
+    "confidence_level": "high ou medium ou low",
+    "risk_score": "nombre entre 0.0 et 1.0",
+    "risk_level": "faible ou modere ou eleve",
+    "points_forts": ["point 1", "point 2"],
+    "points_faibles":  ["point 1", "point 2"],
+    "reasoning": "Explication en 2-3 phrases",
+    "conditions": ["condition 1 si necessaire"],
+    "red_flags": ["alerte si presente"],
+    "summary": "Resume en 1 phrase"
+}
+"""
+        return prompt
+    
+    def _call_llm(self, prompt:  str) -> Dict[str, Any]:
+        if not self.llm_enabled:
+            return self._fallback()
         
-        if success_rate >= 0.8:
-            risk_level = "faible"
-            emoji = "✅"
-        elif success_rate >= 0.6:
-            risk_level = "modéré"
-            emoji = "⚠️"
-        else: 
-            risk_level = "élevé"
-            emoji = "❌"
-        
-        insight = f"{emoji} Profil à risque {risk_level}.  "
-        insight += f"Sur {total} cas similaires trouvés, {good_profiles} ont remboursé avec succès "
-        insight += f"({success_rate*100:.0f}% de taux de succès). "
-        
-        if fraud_cases > 0:
-            insight += f"⚠️ {fraud_cases} cas de fraude détectés parmi les profils similaires. "
-        
-        if patterns:
-            insight += f"Patterns:  {', '.join(patterns[: 2])}."
-        
-        return insight
+        try:
+            response = self.llm_client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.2,
+                max_tokens=1500
+            )
+            return json.loads(response.choices[0].message.content)
+        except Exception as e:
+            print("Erreur LLM: " + str(e))
+            return self._fallback()
+    
+    def _fallback(self) -> Dict[str, Any]:
+        return {
+            "recommendation": "REVISER",
+            "confidence_level": "low",
+            "risk_score":  0.5,
+            "risk_level": "modere",
+            "points_forts": ["Analyse automatique non disponible"],
+            "points_faibles": ["Analyse automatique non disponible"],
+            "reasoning": "Le systeme AI n'est pas disponible.  Revision manuelle necessaire.",
+            "conditions": ["Revision manuelle obligatoire"],
+            "red_flags": ["Analyse automatique indisponible"],
+            "summary": "Revision manuelle requise - systeme AI non disponible."
+        }
     
     def analyze_similarity(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Fonction principale - Analyse la similarité d'un nouveau dossier.
-        """
-        print(f"\n{'='*60}")
-        print("🔍 SIMILARITY AGENT - Analyse en cours...")
-        print(f"{'='*60}")
+        print("")
+        print("=" * 70)
+        print("SIMILARITY AGENT AI - Analyse en cours...")
+        print("=" * 70)
         
-        # Étape 1: Extraire le profil
-        print("\n📋 Étape 1: Extraction du profil...")
+        # Etape 1: Extraction du profil
+        print("")
+        print("Etape 1/5: Extraction du profil...")
+        profile = CreditProfile.from_dict(request)
+        profile_dict = profile.to_dict()
+        print("   Profil extrait:  " + str(profile. loan_amount) + "E sur " + str(profile.loan_duration) + " mois")
+        print("   Ratio d'endettement projete: " + str(profile_dict["projected_debt_ratio"]) + "%")
         
-        if hasattr(request, '__dict__'):
-            profile_data = {
-                'loan_amount': getattr(request, 'requested_amount', 0),
-                'loan_duration': getattr(request, 'loan_duration', 120),
-                'monthly_income':  getattr(request, 'monthly_income', 0),
-                'other_income': getattr(request, 'other_income', 0),
-                'monthly_charges': getattr(request, 'monthly_charges', 0),
-                'employment_type': getattr(request, 'employment_type', 'employee'),
-                'contract_type':  getattr(request, 'contract_type', 'permanent'),
-                'seniority_years': getattr(request, 'seniority_years', 0),
-                'marital_status': getattr(request, 'marital_status', 'single'),
-                'number_of_children': getattr(request, 'number_of_children', 0),
-                'spouse_employed': getattr(request, 'spouse_employed', None),
-                'housing_status':  getattr(request, 'housing_status', 'rent'),
-                'is_primary_holder': getattr(request, 'is_primary_holder', True)
-            }
-        else:
-            profile_data = request
+        # Etape 2: Generation de l'embedding
+        print("")
+        print("Etape 2/5: Generation de l'embedding...")
+        query_vector = self._create_embedding(profile.to_text())
+        print("   Embedding genere: " + str(len(query_vector)) + " dimensions")
         
-        profile = CreditProfile.from_dict(profile_data)
-        print(f"   ✓ Profil extrait:  Prêt de {profile.loan_amount}€ sur {profile.loan_duration} mois")
-        
-        # Étape 2: Générer l'embedding
-        print("\n🧠 Étape 2: Génération de l'embedding...")
-        profile_text = profile.to_text()
-        query_vector = self._create_embedding(profile_text)
-        print(f"   ✓ Embedding généré: vecteur de {len(query_vector)} dimensions")
-        
-        # Étape 3: Rechercher les cas similaires
-        print(f"\n🔎 Étape 3: Recherche des {self.top_k} cas les plus similaires...")
+        # Etape 3: Recherche des cas similaires
+        print("")
+        print("Etape 3/5: Recherche des " + str(self.top_k) + " cas similaires...")
         similar_cases = self._search_similar_cases(query_vector)
-        print(f"   ✓ {len(similar_cases)} cas similaires trouvés")
+        print("   " + str(len(similar_cases)) + " cas similaires trouves")
         
         if similar_cases:
-            print("\n   📊 Cas similaires trouvés:")
-            for i, case in enumerate(similar_cases[: 5], 1):
-                status = "❌ Défaut" if case["defaulted"] else "✅ OK"
-                fraud = " 🚨 FRAUDE" if case["fraud_flag"] else ""
-                print(f"      {i}. Case #{case['case_id']}: Score={case['similarity_score']:.4f} | {status}{fraud}")
+            print("")
+            print("   Top 5 des cas similaires:")
+            for i, c in enumerate(similar_cases[:5], 1):
+                status = "Defaut" if c["defaulted"] else "OK"
+                fraud = " FRAUDE" if c["fraud_flag"] else ""
+                score_pct = int(c["similarity_score"] * 100)
+                print("      " + str(i) + ". Case #" + str(c["case_id"]) + ": " + str(score_pct) + "% | " + status + fraud)
         
-        # Étape 4: Analyser les résultats
-        print("\n📈 Étape 4: Analyse des résultats...")
-        analysis = self._analyze_similar_cases(similar_cases)
+        # Etape 4: Analyse statistique
+        print("")
+        print("Etape 4/5: Analyse statistique...")
+        stats = self._compute_statistics(similar_cases)
+        print("   Taux de succes historique: " + str(int(stats["success_rate"] * 100)) + "%")
+        print("   Taux de defaut historique: " + str(int(stats["default_rate"] * 100)) + "%")
+        print("   Taux de fraude historique: " + str(int(stats["fraud_rate"] * 100)) + "%")
         
-        print(f"\n{'='*60}")
-        print("✅ ANALYSE TERMINÉE")
-        print(f"{'='*60}")
-        print(f"   • Profils similaires OK: {analysis['similar_good_profiles']}")
-        print(f"   • Profils similaires en défaut: {analysis['similar_bad_profiles']}")
-        print(f"   • Taux de succès: {analysis['repayment_success_rate']*100:.1f}%")
-        print(f"   • Ratio de fraude: {analysis['fraud_ratio']*100:.1f}%")
-        print(f"   • Confiance: {analysis['confidence']}")
-        print(f"   • Insight: {analysis['insight']}")
+        # Etape 5: Analyse AI
+        print("")
+        print("Etape 5/5: Analyse AI en cours...")
+        if self.llm_enabled:
+            prompt = self._build_prompt(profile_dict, similar_cases, stats)
+            ai_analysis = self._call_llm(prompt)
+            print("   Analyse LLM terminee")
+        else:
+            print("   LLM non disponible, utilisation de l'analyse de secours")
+            ai_analysis = self._fallback()
         
-        return analysis
+        # Resultat final
+        result = {
+            "profile": profile_dict,
+            "rag_statistics": {
+                "total_similar_cases": stats["total_similar"],
+                "similar_good_profiles": stats["good_profiles"],
+                "similar_bad_profiles": stats["bad_profiles"],
+                "fraud_cases": stats["fraud_cases"],
+                "repayment_success_rate": round(stats["success_rate"], 2),
+                "default_rate": round(stats["default_rate"], 2),
+                "fraud_ratio": round(stats["fraud_rate"], 2),
+                "average_similarity": round(stats["avg_similarity"], 4)
+            },
+            "ai_analysis": ai_analysis,
+            "metadata": {
+                "agent_version": "2.0-AI",
+                "llm_model": LLM_MODEL if self.llm_enabled else "fallback"
+            }
+        }
+        
+        # Affichage du resultat
+        print("")
+        print("=" * 70)
+        print("ANALYSE TERMINEE")
+        print("=" * 70)
+        
+        rec = ai_analysis. get("recommendation", "REVISER")
+        print("")
+        print("   RECOMMANDATION: " + rec)
+        print("   Score de risque: " + str(ai_analysis.get("risk_score", 0.5)))
+        print("   Niveau de confiance: " + str(ai_analysis.get("confidence_level", "low")))
+        print("   Resume: " + str(ai_analysis.get("summary", "N/A")))
+        
+        if ai_analysis.get("red_flags"):
+            print("")
+            print("   ALERTES:")
+            for flag in ai_analysis["red_flags"]:
+                print("      - " + str(flag))
+        
+        if ai_analysis.get("conditions"):
+            print("")
+            print("   CONDITIONS:")
+            for cond in ai_analysis["conditions"]:
+                print("      - " + str(cond))
+        
+        if ai_analysis.get("points_forts"):
+            print("")
+            print("   POINTS FORTS:")
+            for point in ai_analysis["points_forts"][:3]: 
+                print("      - " + str(point))
+        
+        if ai_analysis.get("points_faibles"):
+            print("")
+            print("   POINTS FAIBLES:")
+            for point in ai_analysis["points_faibles"][:3]:
+                print("      - " + str(point))
+        
+        return result
 
 
 # ==============================================================================
-# FONCTION WRAPPER (pour compatibilité avec l'orchestrateur existant)
+# WRAPPER FUNCTIONS
 # ==============================================================================
 
 _agent_instance = None
 
-def get_agent() -> SimilarityAgent: 
-    """Retourne l'instance singleton de l'agent."""
+def get_agent() -> SimilarityAgentAI:
     global _agent_instance
     if _agent_instance is None:
-        _agent_instance = SimilarityAgent()
+        _agent_instance = SimilarityAgentAI()
     return _agent_instance
 
 def analyze_similarity(request) -> Dict[str, Any]: 
-    """
-    Fonction wrapper pour compatibilité avec l'orchestrateur.
-    """
-    agent = get_agent()
-    return agent.analyze_similarity(request)
+    return get_agent().analyze_similarity(request)
 
 
 # ==============================================================================
-# SCRIPT DE TEST
+# TEST
 # ==============================================================================
 
-if __name__ == "__main__": 
-    print("\n" + "="*70)
-    print("🧪 TEST DU SIMILARITY AGENT")
-    print("="*70)
+if __name__ == "__main__":
+    print("")
+    print("=" * 70)
+    print("TEST DU SIMILARITY AGENT AI")
+    print("=" * 70)
     
     test_case = {
-        "loan_amount": 1500000.0,
-        "loan_duration": 6,
-        "monthly_income": 10000.0,
-        "other_income": 0.0,
-        "monthly_charges": 5000.0,
+        "loan_amount": 150000.0,
+        "loan_duration": 240,
+        "monthly_income": 4500.0,
+        "other_income": 500.0,
+        "monthly_charges": 1200.0,
         "employment_type": "employee",
-        "contract_type": "permanent",
-        "seniority_years": 1,
+        "contract_type":  "permanent",
+        "seniority_years": 5,
         "marital_status": "married",
-        "number_of_children": 5,
-        "spouse_employed": False,
+        "number_of_children": 2,
+        "spouse_employed": True,
         "housing_status":  "owner",
         "is_primary_holder": True
     }
     
-    print("\n📝 Cas de test:")
-    print(f"   Montant: {test_case['loan_amount']}€")
-    print(f"   Durée: {test_case['loan_duration']} mois")
-    print(f"   Revenu:  {test_case['monthly_income']}€/mois")
-    print(f"   Emploi: {test_case['employment_type']} ({test_case['contract_type']})")
+    print("")
+    print("CAS DE TEST:")
+    print("   Montant:  " + str(test_case["loan_amount"]) + "E sur " + str(test_case["loan_duration"]) + " mois")
+    print("   Emploi: " + test_case["employment_type"] + " (" + test_case["contract_type"] + ")")
+    print("   Revenus: " + str(test_case["monthly_income"]) + "E/mois")
+    print("   Logement: " + test_case["housing_status"])
+    print("   Situation: " + test_case["marital_status"] + ", " + str(test_case["number_of_children"]) + " enfant(s)")
     
     result = analyze_similarity(test_case)
     
-    print("\n" + "="*70)
-    print("📊 RÉSULTAT FINAL")
-    print("="*70)
-    print(f"\n{result}")
+    print("")
+    print("=" * 70)
+    print("RESULTAT COMPLET (JSON)")
+    print("=" * 70)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
