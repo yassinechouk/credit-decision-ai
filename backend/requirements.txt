@@ -5,7 +5,4 @@ qdrant-client
 sentence-transformers
 langchain
 python-multipart
-qdrant-client>=1.7.0
-sentence-transformers>=2.2.0
-tf-keras>=2.20.0
-numpy>=1.26.0
+openai>=1.0.0openai>=1.0.0
