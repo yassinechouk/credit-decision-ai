@@ -78,7 +78,7 @@ def record_to_text(record:  dict) -> str:
 # ============================================
 
 # Charger le fichier JSON
-with open('credit_dataset.json', 'r') as f:
+with open('/workspaces/credit-decision-ai/data/synthetic/credit_dataset.json', 'r') as f:
     credit_data = json.load(f)
 
 # Préparer les points pour Qdrant
