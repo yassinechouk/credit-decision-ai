@@ -1,33 +1,36 @@
 """
 SIMILARITY AGENT AI - Agent Intelligent pour Décision de Crédit
+Refactorisé avec LangChain & LangGraph
 """
 
 import os
 import json
-from typing import Dict, Any, List, Optional
-from dataclasses import dataclass
-from qdrant_client import QdrantClient
-from sentence_transformers import SentenceTransformer
-from openai import OpenAI
+from typing import Dict, Any, List, Optional, TypedDict
+from dataclasses import dataclass, asdict
 
+# LangChain / LangGraph Imports
+from langgraph.graph import StateGraph, END
+from langchain_openai import ChatOpenAI
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate
+
+# Original Imports maintained for logic
+from qdrant_client import QdrantClient
 
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
 
-QDRANT_URL = os. getenv(
-    "QDRANT_URL", 
-    "https://44775a69-b58f-449f-b5ca-b0f6ec6b5862.europe-west3-0.gcp.cloud.qdrant.io:6333"
-)
-QDRANT_API_KEY = os. getenv(
-    "QDRANT_API_KEY",
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.51Eobf7Ye3tWtM_4YRPqCtAAvPXIssDAJbgm3KHx9ic"
-)
+# SECURITE : On ne met plus de clés en dur ici. Elles doivent être dans le fichier .env
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+
 COLLECTION_NAME = "credit_dataset"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 TOP_K_SIMILAR = 20
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.groq.com/openai/v1")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.1-70b-versatile")
 
@@ -43,7 +46,7 @@ Reponds TOUJOURS en JSON valide."""
 
 
 # ==============================================================================
-# CREDIT PROFILE
+# CREDIT PROFILE (Inchangé)
 # ==============================================================================
 
 @dataclass
@@ -118,94 +121,71 @@ class CreditProfile:
 
 
 # ==============================================================================
-# SIMILARITY AGENT AI
+# LANGGRAPH STATE DEFINITION
+# ==============================================================================
+
+class AgentState(TypedDict):
+    request_data: Dict[str, Any]      # Données brutes d'entrée
+    profile: Optional[CreditProfile]  # Objet profil instancié
+    profile_dict: Dict[str, Any]      # Profil formaté pour calculs
+    query_vector: List[float]         # Embedding
+    similar_cases: List[Dict]         # Résultats Qdrant
+    stats: Dict[str, Any]             # Statistiques calculées
+    ai_analysis: Dict[str, Any]       # Réponse du LLM
+    final_output: Dict[str, Any]      # Résultat final formaté
+
+
+# ==============================================================================
+# SIMILARITY AGENT AI (LangChain Version)
 # ==============================================================================
 
 class SimilarityAgentAI:
     
     def __init__(self):
-        print("Initialisation du Similarity Agent AI...")
+        print("Initialisation du Similarity Agent AI (LangChain/LangGraph)...")
         print("=" * 60)
         
-        self. qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
-        print("Qdrant connecte:  " + QDRANT_URL[: 50] + "...")
+        # 1. Init Vector DB Client (Qdrant)
+        if not QDRANT_URL or not QDRANT_API_KEY:
+             print("ATTENTION: QDRANT_URL ou QDRANT_API_KEY manquant dans les variables d'environnement")
         
-        self.embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+        self.qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+        print(f"Qdrant connecte: {str(QDRANT_URL)[:30]}...")
+        
+        # 2. Init Embeddings (LangChain HuggingFace Wrapper)
+        # Remplace SentenceTransformer direct par LangChain wrapper
+        self.embedding_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
         print("Modele d'embedding: " + EMBEDDING_MODEL)
         
+        # 3. Init LLM (LangChain ChatOpenAI)
         if OPENAI_API_KEY: 
-            self.llm_client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+            self.llm = ChatOpenAI(
+                api_key=OPENAI_API_KEY, 
+                base_url=OPENAI_BASE_URL,
+                model=LLM_MODEL,
+                temperature=0.2,
+                max_tokens=1500,
+                model_kwargs={"response_format": {"type": "json_object"}}
+            )
             self.llm_enabled = True
             print("LLM connecte: " + LLM_MODEL)
         else:
-            self.llm_client = None
+            self.llm = None
             self.llm_enabled = False
             print("LLM non configure (OPENAI_API_KEY manquant)")
         
         self.collection_name = COLLECTION_NAME
         self.top_k = TOP_K_SIMILAR
         
+        # 4. Construire le Graph LangGraph
+        self.graph = self._build_graph()
+
         print("=" * 60)
         print("Similarity Agent AI initialise avec succes!")
-    
-    def _create_embedding(self, text: str) -> List[float]:
-        return self.embedding_model.encode(text).tolist()
-    
-    def _search_similar_cases(self, query_vector: List[float]) -> List[Dict[str, Any]]: 
-        try:
-            results = self.qdrant_client.query_points(
-                collection_name=self.collection_name,
-                query=query_vector,
-                limit=self.top_k,
-                with_payload=True
-            )
-            points = results.points if hasattr(results, "points") else results
-        except Exception as e:
-            print("Erreur Qdrant: " + str(e))
-            points = []
-        
-        similar_cases = []
-        for result in points:
-            payload = result.payload if hasattr(result, "payload") else result. get("payload", {})
-            score = result.score if hasattr(result, "score") else result.get("score", 0)
-            similar_cases.append({
-                "case_id": payload.get("case_id"),
-                "similarity_score": score,
-                "defaulted": payload.get("defaulted", False),
-                "fraud_flag": payload.get("fraud_flag", False),
-                "payload": payload
-            })
-        return similar_cases
-    
-    def _compute_statistics(self, similar_cases: List[Dict]) -> Dict[str, Any]:
-        if not similar_cases:
-            return {
-                "total_similar":  0,
-                "good_profiles": 0,
-                "bad_profiles": 0,
-                "fraud_cases": 0,
-                "success_rate": 0,
-                "default_rate": 0,
-                "fraud_rate": 0,
-                "avg_similarity": 0
-            }
-        
-        total = len(similar_cases)
-        good = sum(1 for c in similar_cases if not c["defaulted"])
-        bad = sum(1 for c in similar_cases if c["defaulted"])
-        fraud = sum(1 for c in similar_cases if c["fraud_flag"])
-        avg_sim = sum(c["similarity_score"] for c in similar_cases) / total
-        
-        return {
-            "total_similar": total,
-            "good_profiles": good,
-            "bad_profiles": bad,
-            "fraud_cases":  fraud,
-            "success_rate": good / total,
-            "default_rate": bad / total,
-            "fraud_rate": fraud / total,
-            "avg_similarity":  avg_sim
-        }
+
+    # --------------------------------------------------------------------------
+    # LOGIQUE METIER (Helpers)
+    # --------------------------------------------------------------------------
     
     def _format_cases_for_llm(self, cases: List[Dict]) -> str:
         if not cases:
@@ -224,7 +204,7 @@ class SimilarityAgentAI:
             lines.append(str(i) + ". [" + str(similarity_pct) + "%] " + status + fraud + " - " + str(loan) + "E/" + str(duration) + "m - " + emp + " (" + contract + ")")
         return "\n".join(lines)
     
-    def _build_prompt(self, profile: Dict, cases: List[Dict], stats: Dict) -> str:
+    def _build_prompt_content(self, profile: Dict, cases: List[Dict], stats: Dict) -> str:
         cases_text = self._format_cases_for_llm(cases)
         success_pct = int(stats["success_rate"] * 100)
         default_pct = int(stats["default_rate"] * 100)
@@ -266,28 +246,8 @@ class SimilarityAgentAI:
 }
 """
         return prompt
-    
-    def _call_llm(self, prompt:  str) -> Dict[str, Any]:
-        if not self.llm_enabled or self.llm_client is None:
-            return self._fallback()
-        
-        try:
-            response = self.llm_client.chat.completions.create(
-                model=LLM_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.2,
-                max_tokens=1500
-            )
-            return json.loads(response.choices[0].message.content)
-        except Exception as e:
-            print("Erreur LLM: " + str(e))
-            return self._fallback()
-    
-    def _fallback(self) -> Dict[str, Any]:
+
+    def _fallback_analysis(self) -> Dict[str, Any]:
         return {
             "recommendation": "REVISER",
             "confidence_level": "low",
@@ -300,31 +260,66 @@ class SimilarityAgentAI:
             "red_flags": ["Analyse automatique indisponible"],
             "summary": "Revision manuelle requise - systeme AI non disponible."
         }
-    
-    def analyze_similarity(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        print("")
-        print("=" * 70)
-        print("SIMILARITY AGENT AI - Analyse en cours...")
-        print("=" * 70)
-        
-        # Etape 1: Extraction du profil
+
+    # --------------------------------------------------------------------------
+    # LANGGRAPH NODES
+    # --------------------------------------------------------------------------
+
+    def node_extract_profile(self, state: AgentState) -> Dict:
+        """Etape 1: Extraction du profil"""
         print("")
         print("Etape 1/5: Extraction du profil...")
-        profile = CreditProfile.from_dict(request)
+        profile = CreditProfile.from_dict(state["request_data"])
         profile_dict = profile.to_dict()
-        print("   Profil extrait:  " + str(profile. loan_amount) + "E sur " + str(profile.loan_duration) + " mois")
+        
+        print("   Profil extrait:  " + str(profile.loan_amount) + "E sur " + str(profile.loan_duration) + " mois")
         print("   Ratio d'endettement projete: " + str(profile_dict["projected_debt_ratio"]) + "%")
         
-        # Etape 2: Generation de l'embedding
+        return {"profile": profile, "profile_dict": profile_dict}
+
+    def node_generate_embedding(self, state: AgentState) -> Dict:
+        """Etape 2: Generation de l'embedding"""
         print("")
         print("Etape 2/5: Generation de l'embedding...")
-        query_vector = self._create_embedding(profile.to_text())
-        print("   Embedding genere: " + str(len(query_vector)) + " dimensions")
+        text_to_embed = state["profile"].to_text()
         
-        # Etape 3: Recherche des cas similaires
+        # Utilisation de LangChain Embeddings
+        query_vector = self.embedding_model.embed_query(text_to_embed)
+        
+        print("   Embedding genere: " + str(len(query_vector)) + " dimensions")
+        return {"query_vector": query_vector}
+
+    def node_search_similar(self, state: AgentState) -> Dict:
+        """Etape 3: Recherche Qdrant"""
         print("")
         print("Etape 3/5: Recherche des " + str(self.top_k) + " cas similaires...")
-        similar_cases = self._search_similar_cases(query_vector)
+        
+        query_vector = state["query_vector"]
+        similar_cases = []
+        
+        try:
+            results = self.qdrant_client.query_points(
+                collection_name=self.collection_name,
+                query=query_vector,
+                limit=self.top_k,
+                with_payload=True
+            )
+            points = results.points if hasattr(results, "points") else results
+        except Exception as e:
+            print("Erreur Qdrant: " + str(e))
+            points = []
+        
+        for result in points:
+            payload = result.payload if hasattr(result, "payload") else result.get("payload", {})
+            score = result.score if hasattr(result, "score") else result.get("score", 0)
+            similar_cases.append({
+                "case_id": payload.get("case_id"),
+                "similarity_score": score,
+                "defaulted": payload.get("defaulted", False),
+                "fraud_flag": payload.get("fraud_flag", False),
+                "payload": payload
+            })
+            
         print("   " + str(len(similar_cases)) + " cas similaires trouves")
         
         if similar_cases:
@@ -335,29 +330,81 @@ class SimilarityAgentAI:
                 fraud = " FRAUDE" if c["fraud_flag"] else ""
                 score_pct = int(c["similarity_score"] * 100)
                 print("      " + str(i) + ". Case #" + str(c["case_id"]) + ": " + str(score_pct) + "% | " + status + fraud)
-        
-        # Etape 4: Analyse statistique
+                
+        return {"similar_cases": similar_cases}
+
+    def node_compute_stats(self, state: AgentState) -> Dict:
+        """Etape 4: Calcul statistiques"""
         print("")
         print("Etape 4/5: Analyse statistique...")
-        stats = self._compute_statistics(similar_cases)
+        similar_cases = state["similar_cases"]
+        
+        if not similar_cases:
+            stats = {
+                "total_similar":  0, "good_profiles": 0, "bad_profiles": 0, "fraud_cases": 0,
+                "success_rate": 0, "default_rate": 0, "fraud_rate": 0, "avg_similarity": 0
+            }
+        else:
+            total = len(similar_cases)
+            good = sum(1 for c in similar_cases if not c["defaulted"])
+            bad = sum(1 for c in similar_cases if c["defaulted"])
+            fraud = sum(1 for c in similar_cases if c["fraud_flag"])
+            avg_sim = sum(c["similarity_score"] for c in similar_cases) / total
+            
+            stats = {
+                "total_similar": total,
+                "good_profiles": good,
+                "bad_profiles": bad,
+                "fraud_cases":  fraud,
+                "success_rate": good / total,
+                "default_rate": bad / total,
+                "fraud_rate": fraud / total,
+                "avg_similarity":  avg_sim
+            }
+            
         print("   Taux de succes historique: " + str(int(stats["success_rate"] * 100)) + "%")
         print("   Taux de defaut historique: " + str(int(stats["default_rate"] * 100)) + "%")
         print("   Taux de fraude historique: " + str(int(stats["fraud_rate"] * 100)) + "%")
         
-        # Etape 5: Analyse AI
+        return {"stats": stats}
+
+    def node_ai_analysis(self, state: AgentState) -> Dict:
+        """Etape 5: Appel LLM via LangChain"""
         print("")
         print("Etape 5/5: Analyse AI en cours...")
-        if self.llm_enabled:
-            prompt = self._build_prompt(profile_dict, similar_cases, stats)
-            ai_analysis = self._call_llm(prompt)
-            print("   Analyse LLM terminee")
-        else:
-            print("   LLM non disponible, utilisation de l'analyse de secours")
-            ai_analysis = self._fallback()
         
-        # Resultat final
+        if not self.llm_enabled:
+            print("   LLM non disponible, utilisation de l'analyse de secours")
+            return {"ai_analysis": self._fallback_analysis()}
+            
+        profile_dict = state["profile_dict"]
+        similar_cases = state["similar_cases"]
+        stats = state["stats"]
+        
+        prompt_content = self._build_prompt_content(profile_dict, similar_cases, stats)
+        
+        try:
+            # Appel LangChain ChatOpenAI
+            messages = [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content=prompt_content)
+            ]
+            response = self.llm.invoke(messages)
+            ai_analysis = json.loads(response.content)
+            print("   Analyse LLM terminee")
+            return {"ai_analysis": ai_analysis}
+            
+        except Exception as e:
+            print("Erreur LLM: " + str(e))
+            return {"ai_analysis": self._fallback_analysis()}
+
+    def node_format_output(self, state: AgentState) -> Dict:
+        """Etape Finale: Construction de la reponse"""
+        stats = state["stats"]
+        ai_analysis = state["ai_analysis"]
+        
         result = {
-            "profile": profile_dict,
+            "profile": state["profile_dict"],
             "rag_statistics": {
                 "total_similar_cases": stats["total_similar"],
                 "similar_good_profiles": stats["good_profiles"],
@@ -370,12 +417,47 @@ class SimilarityAgentAI:
             },
             "ai_analysis": ai_analysis,
             "metadata": {
-                "agent_version": "2.0-AI",
+                "agent_version": "2.0-AI-LangChain",
                 "llm_model": LLM_MODEL if self.llm_enabled else "fallback"
             }
         }
+        return {"final_output": result}
+
+    def _build_graph(self) -> Any:
+        workflow = StateGraph(AgentState)
         
-        # Affichage du resultat
+        # Ajout des noeuds
+        workflow.add_node("extract_profile", self.node_extract_profile)
+        workflow.add_node("generate_embedding", self.node_generate_embedding)
+        workflow.add_node("search_similar", self.node_search_similar)
+        workflow.add_node("compute_stats", self.node_compute_stats)
+        workflow.add_node("ai_analysis", self.node_ai_analysis)
+        workflow.add_node("format_output", self.node_format_output)
+        
+        # Definition des aretes (flux lineaire)
+        workflow.set_entry_point("extract_profile")
+        workflow.add_edge("extract_profile", "generate_embedding")
+        workflow.add_edge("generate_embedding", "search_similar")
+        workflow.add_edge("search_similar", "compute_stats")
+        workflow.add_edge("compute_stats", "ai_analysis")
+        workflow.add_edge("ai_analysis", "format_output")
+        workflow.add_edge("format_output", END)
+        
+        return workflow.compile()
+    
+    def analyze_similarity(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        print("")
+        print("=" * 70)
+        print("SIMILARITY AGENT AI - Analyse en cours...")
+        print("=" * 70)
+        
+        initial_state = {"request_data": request}
+        final_state = self.graph.invoke(initial_state)
+        
+        result = final_state["final_output"]
+        ai_analysis = final_state["ai_analysis"]
+        
+        # Affichage du resultat (Logique d'affichage preservee)
         print("")
         print("=" * 70)
         print("ANALYSE TERMINEE")
@@ -438,7 +520,7 @@ def analyze_similarity(request) -> Dict[str, Any]:
 if __name__ == "__main__":
     print("")
     print("=" * 70)
-    print("TEST DU SIMILARITY AGENT AI")
+    print("TEST DU SIMILARITY AGENT AI (LANGCHAIN)")
     print("=" * 70)
     
     test_case = {
@@ -465,10 +547,16 @@ if __name__ == "__main__":
     print("   Logement: " + test_case["housing_status"])
     print("   Situation: " + test_case["marital_status"] + ", " + str(test_case["number_of_children"]) + " enfant(s)")
     
-    result = analyze_similarity(test_case)
+    # Pour le test local, on peut essayer de lire les env vars
+    # Si elles ne sont pas chargées, assurez-vous de faire: source backend/.env
     
-    print("")
-    print("=" * 70)
-    print("RESULTAT COMPLET (JSON)")
-    print("=" * 70)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    try:
+        result = analyze_similarity(test_case)
+        print("")
+        print("=" * 70)
+        print("RESULTAT COMPLET (JSON)")
+        print("=" * 70)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    except Exception as e:
+        print(f"\nERREUR: {e}")
+        print("Assurez-vous que les variables d'environnement (QDRANT_API_KEY, etc.) sont bien définies.")
