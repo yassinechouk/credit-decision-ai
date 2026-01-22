@@ -12,6 +12,7 @@ build/
 # Editors
 .vscode/
 .idea/
+.venv/
 
 # OS files
 .DS_Store
