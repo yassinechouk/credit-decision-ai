@@ -27,3 +27,7 @@ Thumbs.db
 *.env.local
 .env.development
 .env.production
+.env
+backend/.env
+backend/.env
+backend/.env.backup
