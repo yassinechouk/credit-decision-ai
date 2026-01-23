@@ -1,0 +1,13 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+fastapi
+uvicorn
+pydantic
+qdrant-client
+sentence-transformers
+torch==2.3.1+cpu
+langchain
+langgraph
+langchain-openai
+langchain-huggingface
+python-multipart
+openai>=1.0.0
