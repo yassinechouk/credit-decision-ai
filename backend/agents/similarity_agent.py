@@ -32,7 +32,7 @@ TOP_K_SIMILAR = 20
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.groq.com/openai/v1")
-LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.1-70b-versatile")
+LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 
 
 # ==============================================================================
@@ -164,7 +164,6 @@ class SimilarityAgentAI:
                 base_url=OPENAI_BASE_URL,
                 model=LLM_MODEL,
                 temperature=0.2,
-                max_tokens=1500,
                 model_kwargs={"response_format": {"type": "json_object"}}
             )
             self.llm_enabled = True
@@ -281,7 +280,11 @@ class SimilarityAgentAI:
         """Etape 2: Generation de l'embedding"""
         print("")
         print("Etape 2/5: Generation de l'embedding...")
-        text_to_embed = state["profile"].to_text()
+        profile = state.get("profile")
+        if profile is None:
+            raise ValueError("Profil manquant pour la generation d'embedding")
+
+        text_to_embed = profile.to_text()
         
         # Utilisation de LangChain Embeddings
         query_vector = self.embedding_model.embed_query(text_to_embed)
@@ -294,8 +297,8 @@ class SimilarityAgentAI:
         print("")
         print("Etape 3/5: Recherche des " + str(self.top_k) + " cas similaires...")
         
-        query_vector = state["query_vector"]
-        similar_cases = []
+        query_vector = state.get("query_vector", [])
+        similar_cases: List[Dict[str, Any]] = []
         
         try:
             results = self.qdrant_client.query_points(
@@ -310,8 +313,16 @@ class SimilarityAgentAI:
             points = []
         
         for result in points:
-            payload = result.payload if hasattr(result, "payload") else result.get("payload", {})
-            score = result.score if hasattr(result, "score") else result.get("score", 0)
+            if hasattr(result, "payload"):
+                payload = getattr(result, "payload", {}) or {}
+                score = float(getattr(result, "score", 0) or 0)
+            elif isinstance(result, dict):
+                payload = result.get("payload", {}) or {}
+                score = float(result.get("score", 0) or 0)
+            else:
+                payload = {}
+                score = 0.0
+
             similar_cases.append({
                 "case_id": payload.get("case_id"),
                 "similarity_score": score,
