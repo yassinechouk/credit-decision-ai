@@ -14,7 +14,9 @@ CREATE TABLE IF NOT EXISTS credit_cases (
     status TEXT NOT NULL CHECK (status IN ('DRAFT', 'SUBMITTED', 'UNDER_REVIEW', 'DECIDED')),
     loan_amount NUMERIC(14,2) NOT NULL CHECK (loan_amount > 0),
     loan_duration INTEGER NOT NULL CHECK (loan_duration > 0),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    summary TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS financial_profile (
@@ -55,6 +57,16 @@ CREATE TABLE IF NOT EXISTS decisions (
     decision TEXT NOT NULL CHECK (decision IN ('APPROVE', 'REJECT', 'REVIEW')),
     confidence NUMERIC,
     reason_codes JSONB,
+    note TEXT,
     decided_by BIGINT NOT NULL REFERENCES users(user_id),
     decided_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS comments (
+    comment_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    case_id BIGINT NOT NULL REFERENCES credit_cases(case_id) ON DELETE CASCADE,
+    author_id BIGINT NOT NULL REFERENCES users(user_id),
+    message TEXT NOT NULL,
+    is_public BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
