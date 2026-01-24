@@ -3,6 +3,7 @@ import { AppLayout } from "./components/layout/AppLayout";
 import { LoginPage } from "./routes/LoginPage";
 import { ClientNewRequestPage } from "./routes/client/ClientNewRequestPage";
 import { ClientRequestDetailPage } from "./routes/client/ClientRequestDetailPage";
+import { ClientRequestsPage } from "./routes/client/ClientRequestsPage";
 import { BankerRequestsPage } from "./routes/banker/BankerRequestsPage";
 import { BankerRequestDetailPage } from "./routes/banker/BankerRequestDetailPage";
 import { AuthGuard } from "./routes/guards/AuthGuard";
@@ -25,6 +26,7 @@ export const router = createBrowserRouter([
           </AuthGuard>
         ),
         children: [
+          { path: "requests", element: <ClientRequestsPage /> },
           { path: "requests/new", element: <ClientNewRequestPage /> },
           { path: "requests/:id", element: <ClientRequestDetailPage /> },
         ],

@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.routes import router
+from core.db import init_db
 
 app = FastAPI(title="Credit Decision AI", version="0.2.0")
 
@@ -14,3 +15,8 @@ app.add_middleware(
 )
 
 app.include_router(router)
+
+
+@app.on_event("startup")
+def _startup() -> None:
+    init_db()

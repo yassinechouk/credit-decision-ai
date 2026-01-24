@@ -8,8 +8,8 @@ export const LoginPage = () => {
   const navigate = useNavigate();
   const location = useLocation();
   const { setAuth } = useAuthStore();
-  const [email, setEmail] = useState("banker@example.com");
-  const [password, setPassword] = useState("secret");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -22,7 +22,7 @@ export const LoginPage = () => {
       const res = await http.post<LoginResponse>('/auth/login', payload, { auth: false });
       setAuth({ token: res.token, role: res.role, userId: res.user_id });
       if (res.role === "banker") navigate("/banker/requests", { replace: true });
-      else navigate("/client/requests/new", { replace: true, state: location.state });
+      else navigate("/client/requests", { replace: true, state: location.state });
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -37,11 +37,24 @@ export const LoginPage = () => {
       <form className="grid" style={{ gap: 12 }} onSubmit={onSubmit}>
         <div className="form-group">
           <label>Email</label>
-          <input className="input" value={email} onChange={(e) => setEmail(e.target.value)} required />
+          <input
+            className="input"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            placeholder="banker1@test.com"
+            required
+          />
         </div>
         <div className="form-group">
           <label>Mot de passe</label>
-          <input className="input" type="password" value={password} onChange={(e) => setPassword(e.target.value)} required />
+          <input
+            className="input"
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder="hashed-password"
+            required
+          />
         </div>
         {error && <div style={{ color: "#b91c1c", fontSize: 14 }}>{error}</div>}
         <button className="button-primary" type="submit" disabled={loading}>

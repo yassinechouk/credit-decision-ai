@@ -11,3 +11,4 @@ langchain-openai
 langchain-huggingface
 python-multipart
 openai>=1.0.0
+psycopg2

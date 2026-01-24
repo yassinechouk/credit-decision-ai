@@ -9,8 +9,8 @@ export const ClientNewRequestPage = () => {
   const [duration, setDuration] = useState(24);
   const [income, setIncome] = useState(3000);
   const [charges, setCharges] = useState(800);
-  const [employment, setEmployment] = useState("salaried");
-  const [contract, setContract] = useState("CDI");
+  const [employment, setEmployment] = useState("employee");
+  const [contract, setContract] = useState("permanent");
   const [seniority, setSeniority] = useState(5);
   const [family, setFamily] = useState("single");
   const [documents, setDocuments] = useState("salary.pdf, contract.pdf");
@@ -69,11 +69,20 @@ export const ClientNewRequestPage = () => {
         <div className="grid two">
           <div className="form-group">
             <label>Emploi</label>
-            <input className="input" value={employment} onChange={(e) => setEmployment(e.target.value)} />
+            <select className="input" value={employment} onChange={(e) => setEmployment(e.target.value)}>
+              <option value="employee">Salarié</option>
+              <option value="freelancer">Freelance</option>
+              <option value="self_employed">Indépendant</option>
+              <option value="unemployed">Sans emploi</option>
+            </select>
           </div>
           <div className="form-group">
             <label>Contrat</label>
-            <input className="input" value={contract} onChange={(e) => setContract(e.target.value)} />
+            <select className="input" value={contract} onChange={(e) => setContract(e.target.value)}>
+              <option value="permanent">CDI</option>
+              <option value="temporary">CDD</option>
+              <option value="none">Aucun</option>
+            </select>
           </div>
         </div>
         <div className="grid two">
@@ -83,7 +92,10 @@ export const ClientNewRequestPage = () => {
           </div>
           <div className="form-group">
             <label>Situation familiale</label>
-            <input className="input" value={family} onChange={(e) => setFamily(e.target.value)} />
+            <select className="input" value={family} onChange={(e) => setFamily(e.target.value)}>
+              <option value="single">Célibataire</option>
+              <option value="married">Marié</option>
+            </select>
           </div>
         </div>
         <div className="form-group">
