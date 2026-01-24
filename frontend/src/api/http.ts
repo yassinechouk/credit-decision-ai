@@ -7,6 +7,7 @@ type HttpOptions = RequestInit & { auth?: boolean };
 type HttpClient = {
   get<T>(path: string, opts?: HttpOptions): Promise<T>;
   post<T>(path: string, body?: unknown, opts?: HttpOptions): Promise<T>;
+  postForm<T>(path: string, body: FormData, opts?: HttpOptions): Promise<T>;
 };
 
 const makeHeaders = (auth: boolean): HeadersInit => {
@@ -39,6 +40,17 @@ export const http: HttpClient = {
       body: body ? JSON.stringify(body) : undefined,
       ...opts,
       headers: { ...makeHeaders(opts.auth ?? true), ...(opts.headers || {}) },
+    });
+    return handle<T>(res);
+  },
+  async postForm<T>(path: string, body: FormData, opts: HttpOptions = {}) {
+    const headers = makeHeaders(opts.auth ?? true);
+    const { ["Content-Type"]: _ignored, ...rest } = headers as Record<string, string>;
+    const res = await fetch(`${API_BASE}${path}`, {
+      method: "POST",
+      body,
+      ...opts,
+      headers: { ...rest, ...(opts.headers || {}) },
     });
     return handle<T>(res);
   },

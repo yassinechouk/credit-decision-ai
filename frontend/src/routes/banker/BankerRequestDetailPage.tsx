@@ -17,6 +17,9 @@ export const BankerRequestDetailPage = () => {
   const [note, setNote] = useState("");
   const [comment, setComment] = useState("");
   const [selectedAgent, setSelectedAgent] = useState<string>("document");
+  const [uploadFiles, setUploadFiles] = useState<File[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
 
   const load = async () => {
     try {
@@ -57,9 +60,44 @@ export const BankerRequestDetailPage = () => {
     }
   };
 
+  const uploadDocuments = async () => {
+    if (!id) return;
+    if (uploadFiles.length === 0) {
+      setUploadError("Veuillez sélectionner au moins un fichier.");
+      return;
+    }
+    setUploading(true);
+    setUploadError(null);
+    try {
+      const form = new FormData();
+      uploadFiles.forEach((file) => form.append("files", file));
+      const res = await http.postForm<BankerRequest>(`/banker/credit-requests/${id}/documents`, form);
+      setData(res);
+      setUploadFiles([]);
+    } catch (err) {
+      setUploadError((err as Error).message);
+    } finally {
+      setUploading(false);
+    }
+  };
+
   if (loading) return <div className="card">Chargement...</div>;
   if (error) return <div className="card">Erreur: {error}</div>;
   if (!data) return <div className="card">Aucune donnée</div>;
+
+  const allFlags = Array.from(
+    new Set(
+      [
+        data.agents?.document?.flags,
+        data.agents?.behavior?.flags,
+        data.agents?.similarity?.flags,
+        data.agents?.image?.flags,
+        data.agents?.fraud?.flags,
+      ]
+        .flat()
+        .filter((flag): flag is string => typeof flag === "string" && flag.length > 0)
+    )
+  );
 
   return (
     <div className="grid" style={{ gap: 12 }}>
@@ -100,12 +138,52 @@ export const BankerRequestDetailPage = () => {
           <ul style={{ paddingLeft: 16 }}>
             {data.documents.map((doc) => (
               <li key={doc.document_id} style={{ color: "#475569" }}>
-                {doc.document_type}: {doc.file_path}
+                {doc.document_type}: {doc.file_path}{" "}
+                <a
+                  href={`/api/files/${data.id}/${encodeURIComponent(doc.file_path.split("/").pop() || doc.file_path)}`}
+                  style={{ marginLeft: 6 }}
+                >
+                  Télécharger
+                </a>
               </li>
             ))}
           </ul>
         ) : (
           <p style={{ color: "#475569" }}>Aucun document.</p>
+        )}
+        <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
+          <label>Ajouter des documents</label>
+          <input
+            className="input"
+            type="file"
+            multiple
+            onChange={(e) => setUploadFiles(Array.from(e.target.files || []))}
+          />
+          <button
+            type="button"
+            className="button-ghost"
+            onClick={uploadDocuments}
+            disabled={uploading || uploadFiles.length === 0}
+          >
+            {uploading ? "Upload..." : "Uploader"}
+          </button>
+          {uploadError && <div style={{ color: "#b91c1c", fontSize: 14 }}>{uploadError}</div>}
+        </div>
+      </div>
+
+      <div className="card">
+        <h3>Analyse globale</h3>
+        <p style={{ color: "#475569" }}>
+          {data.summary || "Synthèse indisponible pour le moment."}
+        </p>
+        {allFlags.length > 0 && (
+          <div style={{ marginTop: 8, display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {allFlags.map((flag) => (
+              <span key={flag} className="badge" style={{ background: "#fef3c7", color: "#92400e" }}>
+                {flag}
+              </span>
+            ))}
+          </div>
         )}
       </div>
 

@@ -13,7 +13,8 @@ export const ClientNewRequestPage = () => {
   const [contract, setContract] = useState("permanent");
   const [seniority, setSeniority] = useState(5);
   const [family, setFamily] = useState("single");
-  const [documents, setDocuments] = useState("salary.pdf, contract.pdf");
+  const [documents, setDocuments] = useState<File[]>([]);
+  const [documentNames, setDocumentNames] = useState("salary.pdf, contract.pdf");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -31,9 +32,17 @@ export const ClientNewRequestPage = () => {
         contract_type: contract,
         seniority_years: seniority,
         family_status: family,
-        documents: documents.split(",").map((d) => d.trim()).filter(Boolean),
+        documents: documentNames.split(",").map((d) => d.trim()).filter(Boolean),
       };
-      const res = await http.post<CreditRequest>("/client/credit-requests", payload);
+      let res: CreditRequest;
+      if (documents.length > 0) {
+        const form = new FormData();
+        form.append("payload", JSON.stringify(payload));
+        documents.forEach((file) => form.append("files", file));
+        res = await http.postForm<CreditRequest>("/client/credit-requests/upload", form);
+      } else {
+        res = await http.post<CreditRequest>("/client/credit-requests", payload);
+      }
       navigate(`/client/requests/${res.id}`);
     } catch (err) {
       setError((err as Error).message);
@@ -99,8 +108,28 @@ export const ClientNewRequestPage = () => {
           </div>
         </div>
         <div className="form-group">
-          <label>Documents (séparés par des virgules)</label>
-          <input className="input" value={documents} onChange={(e) => setDocuments(e.target.value)} />
+          <label>Documents (upload)</label>
+          <input
+            className="input"
+            type="file"
+            multiple
+            onChange={(e) => {
+              const files = Array.from(e.target.files || []);
+              setDocuments(files);
+              if (files.length > 0) {
+                setDocumentNames(files.map((f) => f.name).join(", "));
+              }
+            }}
+          />
+          {documents.length === 0 && (
+            <input
+              className="input"
+              style={{ marginTop: 8 }}
+              placeholder="Ou liste des documents (ex: salary.pdf, contract.pdf)"
+              value={documentNames}
+              onChange={(e) => setDocumentNames(e.target.value)}
+            />
+          )}
         </div>
         {error && <div style={{ color: "#b91c1c", fontSize: 14 }}>{error}</div>}
         <button className="button-primary" type="submit" disabled={loading}>

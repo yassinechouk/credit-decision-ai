@@ -138,9 +138,11 @@ def _build_documents_payload(request_data: Dict[str, Any]) -> List[Dict[str, Any
     if isinstance(documents, list):
         for doc in documents:
             if isinstance(doc, dict):
-                filename = doc.get("filename") or doc.get("name") or ""
+                filename = str(doc.get("filename") or doc.get("name") or doc.get("file_path") or "")
+                if "/" in filename:
+                    filename = filename.split("/")[-1]
                 payloads.append({
-                    "doc_type": doc.get("doc_type") or _infer_doc_type(filename),
+                    "doc_type": doc.get("doc_type") or doc.get("document_type") or _infer_doc_type(filename),
                     "raw_text": doc.get("raw_text") or doc.get("text") or "",
                     "filename": filename or None,
                 })

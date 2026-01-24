@@ -104,7 +104,11 @@ def fetch_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
         conn.close()
 
 
-def create_credit_request(user_id: int, payload: Dict[str, Any], orchestration: Dict[str, Any]) -> Dict[str, Any]:
+def create_credit_request(
+    user_id: int,
+    payload: Dict[str, Any],
+    orchestration: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     conn = _connect()
     try:
         with conn:
@@ -119,7 +123,7 @@ def create_credit_request(user_id: int, payload: Dict[str, Any], orchestration: 
                         user_id,
                         payload.get("amount"),
                         payload.get("duration_months"),
-                        (orchestration or {}).get("summary"),
+                        (orchestration or {}).get("summary") if orchestration else None,
                     ),
                 )
                 case_row = cur.fetchone()
@@ -149,7 +153,7 @@ def create_credit_request(user_id: int, payload: Dict[str, Any], orchestration: 
                         payload.get("other_income", 0),
                         payload.get("monthly_charges"),
                         payload.get("employment_type"),
-                        payload.get("contract_type"),
+                        _normalize_contract_type(payload.get("contract_type")),
                         payload.get("seniority_years"),
                         payload.get("family_status"),
                         payload.get("number_of_children", 0),
@@ -159,18 +163,127 @@ def create_credit_request(user_id: int, payload: Dict[str, Any], orchestration: 
                     ),
                 )
 
-                documents = payload.get("documents") or []
-                for doc in documents:
-                    doc_hash = hashlib.sha256(str(doc).encode("utf-8")).hexdigest()
+                _insert_documents(cur, case_id, payload.get("documents") or [])
+
+                if orchestration:
+                    agents = (orchestration or {}).get("agents") or {}
+                    for agent_name, output in agents.items():
+                        if agent_name not in {"document", "similarity", "behavior", "fraud", "image"}:
+                            continue
+                        cur.execute(
+                            """
+                            INSERT INTO agent_outputs (case_id, agent_name, output_json)
+                            VALUES (%s, %s, %s::jsonb)
+                            """,
+                            (case_id, agent_name, json.dumps(output)),
+                        )
+
+                return {
+                    "case_id": case_id,
+                    "created_at": case_row["created_at"],
+                    "updated_at": case_row["updated_at"],
+                }
+    finally:
+        conn.close()
+
+
+def _normalize_contract_type(raw: Optional[str]) -> Optional[str]:
+    if raw is None:
+        return None
+    normalized = str(raw).strip().lower()
+    if not normalized:
+        return None
+    mapping = {
+        "cdi": "permanent",
+        "permanent": "permanent",
+        "permanentcontract": "permanent",
+        "cdd": "temporary",
+        "temporary": "temporary",
+        "interim": "temporary",
+        "interimaire": "temporary",
+        "freelance": "none",
+        "independent": "none",
+        "contractor": "none",
+        "consultant": "none",
+        "none": "none",
+    }
+    return mapping.get(normalized, normalized)
+
+
+def _insert_documents(cur, case_id: int, documents: List[Any]) -> None:
+    for doc in documents or []:
+        if isinstance(doc, dict):
+            file_path = str(doc.get("file_path") or doc.get("path") or "")
+            if not file_path:
+                continue
+            doc_type = str(doc.get("document_type") or doc.get("doc_type") or "uploaded")
+            doc_hash = str(doc.get("file_hash") or "")
+            if not doc_hash:
+                doc_hash = hashlib.sha256(file_path.encode("utf-8")).hexdigest()
+        else:
+            file_path = str(doc)
+            doc_type = "uploaded"
+            doc_hash = hashlib.sha256(file_path.encode("utf-8")).hexdigest()
+        cur.execute(
+            """
+            INSERT INTO documents (case_id, document_type, file_path, file_hash)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (case_id, doc_type, file_path, doc_hash),
+        )
+
+
+def add_case_documents(case_id: int, documents: List[Dict[str, Any]]) -> None:
+    if not documents:
+        return
+    conn = _connect()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                _insert_documents(cur, case_id, documents)
+    finally:
+        conn.close()
+
+
+def save_orchestration(case_id: int, orchestration: Dict[str, Any]) -> None:
+    if not orchestration:
+        return
+    conn = _connect()
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                summary = orchestration.get("summary")
+                if summary is not None:
                     cur.execute(
                         """
-                        INSERT INTO documents (case_id, document_type, file_path, file_hash)
-                        VALUES (%s, %s, %s, %s)
+                        UPDATE credit_cases
+                        SET summary = %s,
+                            updated_at = NOW(),
+                            status = 'UNDER_REVIEW'
+                        WHERE case_id = %s
                         """,
-                        (case_id, "uploaded", str(doc), doc_hash),
+                        (summary, case_id),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE credit_cases
+                        SET updated_at = NOW(),
+                            status = 'UNDER_REVIEW'
+                        WHERE case_id = %s
+                        """,
+                        (case_id,),
                     )
 
-                agents = (orchestration or {}).get("agents") or {}
+                cur.execute(
+                    """
+                    DELETE FROM agent_outputs
+                    WHERE case_id = %s
+                    """,
+                    (case_id,),
+                )
+
+                agents = orchestration.get("agents") or {}
                 for agent_name, output in agents.items():
                     if agent_name not in {"document", "similarity", "behavior", "fraud", "image"}:
                         continue
@@ -181,12 +294,6 @@ def create_credit_request(user_id: int, payload: Dict[str, Any], orchestration: 
                         """,
                         (case_id, agent_name, json.dumps(output)),
                     )
-
-                return {
-                    "case_id": case_id,
-                    "created_at": case_row["created_at"],
-                    "updated_at": case_row["updated_at"],
-                }
     finally:
         conn.close()
 

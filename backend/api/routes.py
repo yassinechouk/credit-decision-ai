@@ -2,7 +2,12 @@ from datetime import datetime, timezone
 from uuid import uuid4
 from typing import Dict, Optional, List, Any
 
-from fastapi import APIRouter, HTTPException, Depends
+import json
+import os
+import hashlib
+from pathlib import Path
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form
+from fastapi.responses import FileResponse
 
 from api.schemas import (
     LoginRequest,
@@ -32,6 +37,8 @@ from core.db import (
     upsert_decision,
     add_comment as add_comment_db,
     list_cases_for_client,
+    save_orchestration,
+    add_case_documents,
 )
 from agents.chat_agent import generate_agent_reply
 
@@ -40,6 +47,7 @@ router = APIRouter(prefix="/api")
 
 
 _agent_chats: Dict[str, Dict[str, list[AgentChatMessage]]] = {}
+UPLOAD_ROOT = os.getenv("UPLOAD_DIR", "/app/data/uploads")
 
 
 def _require_role(user: Dict[str, Any], role: str) -> None:
@@ -146,6 +154,57 @@ def _get_chat_messages(req_id: str, agent_name: str) -> list[AgentChatMessage]:
     return agent_bucket.setdefault(agent_name, [])
 
 
+def _parse_json_field(raw: Optional[str]) -> Any:
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _infer_doc_type(filename: str) -> str:
+    lower = filename.lower()
+    if "salary" in lower or "pay" in lower or "bulletin" in lower or "payslip" in lower:
+        return "salary_slip"
+    if "contract" in lower or "contrat" in lower or "employment" in lower:
+        return "employment_contract"
+    if "bank" in lower or "statement" in lower or "releve" in lower:
+        return "bank_statement"
+    if "invoice" in lower or "facture" in lower:
+        return "invoice"
+    return "uploaded"
+
+
+def _safe_filename(name: str) -> str:
+    return os.path.basename(name).replace("\\", "/").split("/")[-1]
+
+
+async def _store_files(case_id: int, files: Optional[List[UploadFile]]) -> List[Dict[str, str]]:
+    stored_documents: List[Dict[str, str]] = []
+    files = files or []
+    if not files:
+        return stored_documents
+    dest_dir = Path(UPLOAD_ROOT) / str(case_id)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for file in files:
+        filename = _safe_filename(file.filename or "document")
+        dest_path = dest_dir / filename
+        data = await file.read()
+        dest_path.write_bytes(data)
+        doc_type = _infer_doc_type(filename)
+        stored_documents.append(
+            {
+                "file_path": str(dest_path),
+                "document_type": doc_type,
+                "file_hash": hashlib.sha256(data).hexdigest(),
+                "filename": filename,
+                "doc_type": doc_type,
+            }
+        )
+    return stored_documents
+
+
 def _build_banker_request(detail: Dict[str, Any]) -> BankerRequest:
     return BankerRequest(
         id=str(detail["case_id"]),
@@ -200,8 +259,49 @@ def login(body: LoginRequest):
 @router.post("/client/credit-requests", response_model=CreditRequest)
 def create_credit_request(body: CreditRequestCreate, user=Depends(get_current_user)):
     _require_role(user, "client")
-    orchestration = run_orchestrator(body.model_dump())
-    created = create_credit_request_db(user["user_id"], body.model_dump(), orchestration)
+    created = create_credit_request_db(user["user_id"], body.model_dump(), None)
+    case_id = int(created["case_id"])
+    orchestration = run_orchestrator({**body.model_dump(), "case_id": case_id})
+    save_orchestration(case_id, orchestration)
+    detail = fetch_case_detail_for_client(created["case_id"], user["user_id"])
+    if not detail:
+        raise HTTPException(status_code=500, detail="Failed to create request")
+    decision_info = _map_decision(detail.get("decision"))
+    return CreditRequest(
+        id=str(detail["case_id"]),
+        status=_map_status(detail["status"], detail.get("decision")),
+        created_at=detail["created_at"],
+        updated_at=detail["updated_at"],
+        client_id=str(detail["user_id"]),
+        summary=detail.get("summary") or "Dossier créé",
+        customer_explanation=None,
+        agents=_map_agent_outputs(detail.get("agent_outputs", [])),
+        decision=decision_info,
+        comments=_map_comments(detail.get("comments", [])),
+    )
+
+
+@router.post("/client/credit-requests/upload", response_model=CreditRequest)
+async def create_credit_request_upload(
+    user=Depends(get_current_user),
+    payload: str = Form(...),
+    files: Optional[List[UploadFile]] = File(default=None),
+):
+    _require_role(user, "client")
+    payload_data = _parse_json_field(payload)
+    if not isinstance(payload_data, dict):
+        raise HTTPException(status_code=400, detail="Invalid payload")
+
+    created = create_credit_request_db(user["user_id"], payload_data, None)
+    case_id = int(created["case_id"])
+
+    stored_documents = await _store_files(case_id, files)
+
+    if stored_documents:
+        payload_data = {**payload_data, "documents": stored_documents}
+    orchestration = run_orchestrator({**payload_data, "case_id": case_id})
+    save_orchestration(case_id, orchestration)
+
     detail = fetch_case_detail_for_client(created["case_id"], user["user_id"])
     if not detail:
         raise HTTPException(status_code=500, detail="Failed to create request")
@@ -287,6 +387,58 @@ def get_request_detail(req_id: str, user: Dict = Depends(get_current_user)):
     return _build_banker_request(detail)
 
 
+@router.get("/files/{case_id}/{filename}")
+def download_file(case_id: int, filename: str, user: Dict = Depends(get_current_user)):
+    case_detail: Optional[Dict[str, Any]] = None
+    if user.get("role") == "client":
+        case_detail = fetch_case_detail_for_client(case_id, user["user_id"])
+    else:
+        case_detail = fetch_case_detail(case_id)
+    if not case_detail:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    safe_name = _safe_filename(filename)
+    documents = case_detail.get("documents", [])
+    match = None
+    for doc in documents:
+        path = str(doc.get("file_path") or "")
+        if os.path.basename(path) == safe_name:
+            match = path
+            break
+    if not match or not os.path.exists(match):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return FileResponse(match, filename=safe_name)
+
+
+@router.post("/banker/credit-requests/{req_id}/documents", response_model=BankerRequest)
+async def upload_case_documents(
+    req_id: str,
+    user: Dict = Depends(get_current_user),
+    files: Optional[List[UploadFile]] = File(default=None),
+):
+    _require_role(user, "banker")
+    detail = fetch_case_detail(int(req_id))
+    if not detail:
+        raise HTTPException(status_code=404, detail="Credit request not found")
+
+    stored_documents = await _store_files(int(req_id), files)
+    if not stored_documents:
+        raise HTTPException(status_code=400, detail="No files uploaded")
+
+    add_case_documents(int(req_id), stored_documents)
+
+    refreshed = fetch_case_detail(int(req_id))
+    if refreshed:
+        orchestration = run_orchestrator(refreshed)
+        save_orchestration(int(req_id), orchestration)
+
+    final_detail = fetch_case_detail(int(req_id))
+    if not final_detail:
+        raise HTTPException(status_code=404, detail="Credit request not found")
+    return _build_banker_request(final_detail)
+
+
 @router.post("/banker/credit-requests/{req_id}/decision")
 def submit_decision(req_id: str, body: DecisionCreate, user: Dict = Depends(get_current_user)):
     _require_role(user, "banker")
@@ -346,5 +498,6 @@ def rerun_agents(req_id: str, _: Dict = Depends(get_current_user)):
     if not detail:
         raise HTTPException(status_code=404, detail="Credit request not found")
     result = run_orchestrator(detail)
+    save_orchestration(int(req_id), result)
     agents = result.get("agents") or None
     return {"status": "ok", "agents": agents}
