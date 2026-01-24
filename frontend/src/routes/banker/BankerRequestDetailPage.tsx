@@ -5,7 +5,7 @@ import { AgentPanel } from "../../components/agents/AgentPanel";
 import { AgentChatPanel } from "../../components/agents/AgentChatPanel";
 import { BankerRequest, DecisionCreate } from "../../api/types";
 
-const AGENTS = ["document", "behavior", "similarity", "image", "fraud", "explanation"];
+const AGENTS = ["document", "behavior", "similarity", "image", "fraud"];
 
 export const BankerRequestDetailPage = () => {
   const { id } = useParams();
