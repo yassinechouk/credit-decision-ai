@@ -292,12 +292,14 @@ async def create_credit_request_upload(
     if not isinstance(payload_data, dict):
         raise HTTPException(status_code=400, detail="Invalid payload")
 
-    created = create_credit_request_db(user["user_id"], payload_data, None)
+    payload_for_db = {**payload_data, "documents": []}
+    created = create_credit_request_db(user["user_id"], payload_for_db, None)
     case_id = int(created["case_id"])
 
     stored_documents = await _store_files(case_id, files)
 
     if stored_documents:
+        add_case_documents(case_id, stored_documents)
         payload_data = {**payload_data, "documents": stored_documents}
     orchestration = run_orchestrator({**payload_data, "case_id": case_id})
     save_orchestration(case_id, orchestration)
