@@ -24,6 +24,9 @@ Thumbs.db
 # Docker artifacts
 *.pid
 
+# Runtime uploads
+data/uploads/
+
 # Keep .env tracked (team-shared), ignore variants
 *.env.local
 .env.development
