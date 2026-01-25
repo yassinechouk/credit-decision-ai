@@ -7,6 +7,10 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, default=str)
+
+
 def _get_db_params() -> Dict[str, str]:
     return {
         "host": os.getenv("DB_HOST", "postgres"),
@@ -40,6 +44,24 @@ def init_db() -> None:
                 )
                 cur.execute(
                     """
+                    ALTER TABLE credit_cases
+                    ADD COLUMN IF NOT EXISTS auto_decision TEXT
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE credit_cases
+                    ADD COLUMN IF NOT EXISTS auto_decision_confidence NUMERIC
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE credit_cases
+                    ADD COLUMN IF NOT EXISTS auto_review_required BOOLEAN
+                    """
+                )
+                cur.execute(
+                    """
                     ALTER TABLE decisions
                     ADD COLUMN IF NOT EXISTS note TEXT
                     """
@@ -53,6 +75,19 @@ def init_db() -> None:
                         message TEXT NOT NULL,
                         is_public BOOLEAN NOT NULL DEFAULT TRUE,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS agent_sessions (
+                        session_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                        case_id BIGINT NOT NULL REFERENCES credit_cases(case_id) ON DELETE CASCADE,
+                        agent_name TEXT NOT NULL,
+                        snapshot_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        messages_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        UNIQUE (case_id, agent_name)
                     )
                     """
                 )
@@ -241,6 +276,14 @@ def add_case_documents(case_id: int, documents: List[Dict[str, Any]]) -> None:
         with conn:
             with conn.cursor() as cur:
                 _insert_documents(cur, case_id, documents)
+                cur.execute(
+                    """
+                    UPDATE credit_cases
+                    SET updated_at = NOW()
+                    WHERE case_id = %s
+                    """,
+                    (case_id,),
+                )
     finally:
         conn.close()
 
@@ -253,26 +296,36 @@ def save_orchestration(case_id: int, orchestration: Dict[str, Any]) -> None:
         with conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 summary = orchestration.get("summary")
+                decision_payload = orchestration.get("decision") or {}
+                auto_decision = decision_payload.get("decision") if isinstance(decision_payload, dict) else None
+                auto_confidence = decision_payload.get("decision_confidence") if isinstance(decision_payload, dict) else None
+                auto_review_required = decision_payload.get("human_review_required") if isinstance(decision_payload, dict) else None
                 if summary is not None:
                     cur.execute(
                         """
                         UPDATE credit_cases
                         SET summary = %s,
+                            auto_decision = %s,
+                            auto_decision_confidence = %s,
+                            auto_review_required = %s,
                             updated_at = NOW(),
                             status = 'UNDER_REVIEW'
                         WHERE case_id = %s
                         """,
-                        (summary, case_id),
+                        (summary, auto_decision, auto_confidence, auto_review_required, case_id),
                     )
                 else:
                     cur.execute(
                         """
                         UPDATE credit_cases
-                        SET updated_at = NOW(),
+                        SET auto_decision = %s,
+                            auto_decision_confidence = %s,
+                            auto_review_required = %s,
+                            updated_at = NOW(),
                             status = 'UNDER_REVIEW'
                         WHERE case_id = %s
                         """,
-                        (case_id,),
+                        (auto_decision, auto_confidence, auto_review_required, case_id),
                     )
 
                 cur.execute(
@@ -294,6 +347,64 @@ def save_orchestration(case_id: int, orchestration: Dict[str, Any]) -> None:
                         """,
                         (case_id, agent_name, json.dumps(output)),
                     )
+    finally:
+        conn.close()
+
+
+def get_agent_session(case_id: int, agent_name: str) -> Optional[Dict[str, Any]]:
+    conn = _connect()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT session_id, case_id, agent_name, snapshot_json, messages_json, updated_at
+                FROM agent_sessions
+                WHERE case_id = %s AND agent_name = %s
+                """,
+                (case_id, agent_name),
+            )
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def upsert_agent_session(case_id: int, agent_name: str, snapshot: Dict[str, Any], messages: List[Dict[str, Any]]) -> None:
+    conn = _connect()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO agent_sessions (case_id, agent_name, snapshot_json, messages_json)
+                    VALUES (%s, %s, %s::jsonb, %s::jsonb)
+                    ON CONFLICT (case_id, agent_name)
+                    DO UPDATE SET
+                        snapshot_json = EXCLUDED.snapshot_json,
+                        messages_json = EXCLUDED.messages_json,
+                        updated_at = NOW()
+                    """,
+                    (case_id, agent_name, _json_dumps(snapshot), _json_dumps(messages)),
+                )
+    finally:
+        conn.close()
+
+
+def ensure_agent_session_snapshot(case_id: int, agent_name: str, snapshot: Dict[str, Any]) -> None:
+    conn = _connect()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO agent_sessions (case_id, agent_name, snapshot_json)
+                    VALUES (%s, %s, %s::jsonb)
+                    ON CONFLICT (case_id, agent_name)
+                    DO UPDATE SET
+                        snapshot_json = EXCLUDED.snapshot_json,
+                        updated_at = NOW()
+                    """,
+                    (case_id, agent_name, _json_dumps(snapshot)),
+                )
     finally:
         conn.close()
 
@@ -366,6 +477,9 @@ def fetch_case_detail(case_id: int) -> Optional[Dict[str, Any]]:
                     c.loan_amount,
                     c.loan_duration,
                     c.summary,
+                    c.auto_decision,
+                    c.auto_decision_confidence,
+                    c.auto_review_required,
                     c.created_at,
                     c.updated_at,
                     f.monthly_income,

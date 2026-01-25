@@ -142,11 +142,17 @@ def _build_agent_context(agent_name: str, request: Dict[str, Any]) -> Dict[str, 
         "amount": request.get("amount"),
         "duration_months": request.get("duration_months"),
         "monthly_income": request.get("monthly_income"),
+        "other_income": request.get("other_income"),
         "monthly_charges": request.get("monthly_charges"),
         "employment_type": request.get("employment_type"),
         "contract_type": request.get("contract_type"),
         "seniority_years": request.get("seniority_years"),
         "family_status": request.get("family_status"),
+        "marital_status": request.get("marital_status"),
+        "number_of_children": request.get("number_of_children"),
+        "spouse_employed": request.get("spouse_employed"),
+        "housing_status": request.get("housing_status"),
+        "is_primary_holder": request.get("is_primary_holder"),
         "documents": request.get("documents"),
     }
 
@@ -186,13 +192,29 @@ def _fallback_reply(agent_name: str, request: Dict[str, Any]) -> str:
     return "Résumé rapide (LLM indisponible): " + " | ".join(summaries)
 
 
-def generate_agent_reply(agent_name: str, request: Dict[str, Any], history: List[Dict[str, Any]]) -> str:
+def build_initial_agent_reply(agent_name: str, request: Dict[str, Any]) -> Dict[str, Any]:
+    agent_name = agent_name.lower()
+    context = _build_agent_context(agent_name, request)
+    raw_summary = _fallback_reply(agent_name, request)
+    summary = raw_summary.replace("Résumé rapide (LLM indisponible): ", "Analyse initiale: ")
+    if summary == raw_summary:
+        summary = "Analyse initiale: " + raw_summary
+    return {
+        "summary": summary,
+        "structured_output": context.get("agent_output", {}),
+    }
+
+
+def generate_agent_reply(agent_name: str, request: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[str, Any]:
     agent_name = agent_name.lower()
     client = _llm_client()
     context = _build_agent_context(agent_name, request)
 
     if not client:
-        return _fallback_reply(agent_name, request)
+        return {
+            "summary": _fallback_reply(agent_name, request),
+            "structured_output": context.get("agent_output", {}),
+        }
 
     system_prompt = (
         "Tu es un agent interne qui aide un analyste bancaire. "
@@ -220,6 +242,13 @@ def generate_agent_reply(agent_name: str, request: Dict[str, Any], history: List
             max_tokens=400,
             temperature=0.2,
         )
-        return chat.choices[0].message.content or _fallback_reply(agent_name, request)
+        summary = chat.choices[0].message.content or _fallback_reply(agent_name, request)
+        return {
+            "summary": summary,
+            "structured_output": context.get("agent_output", {}),
+        }
     except Exception:
-        return _fallback_reply(agent_name, request)
+        return {
+            "summary": _fallback_reply(agent_name, request),
+            "structured_output": context.get("agent_output", {}),
+        }

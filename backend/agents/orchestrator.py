@@ -281,7 +281,10 @@ class OrchestratorAgent:
             sim_data = sim_output.data.get("ai_analysis", {})
             rag_stats = sim_output.data.get("rag_statistics", {})
             aggregated["similarity_patterns"] = [sim_data.get("recommendation", "REVISER")]
-            aggregated["scores"]["similarity_risk"] = sim_data.get("risk_score", 0.5)
+            try:
+                aggregated["scores"]["similarity_risk"] = float(sim_data.get("risk_score", 0.5))
+            except (TypeError, ValueError):
+                aggregated["scores"]["similarity_risk"] = 0.5
             aggregated["scores"]["peer_success_rate"] = rag_stats.get("repayment_success_rate", 0.0)
             aggregated["risk_levels"]["similarity"] = sim_data.get("risk_level", "modere")
         

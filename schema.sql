@@ -15,6 +15,9 @@ CREATE TABLE IF NOT EXISTS credit_cases (
     loan_amount NUMERIC(14,2) NOT NULL CHECK (loan_amount > 0),
     loan_duration INTEGER NOT NULL CHECK (loan_duration > 0),
     summary TEXT,
+    auto_decision TEXT,
+    auto_decision_confidence NUMERIC,
+    auto_review_required BOOLEAN,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -70,3 +73,86 @@ CREATE TABLE IF NOT EXISTS comments (
     is_public BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Loans created from approved credit cases
+CREATE TABLE IF NOT EXISTS loans (
+    loan_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    case_id BIGINT UNIQUE REFERENCES credit_cases(case_id) ON DELETE SET NULL,
+    user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    lender_name TEXT,
+    product_type TEXT,
+    purpose TEXT,
+    start_date DATE NOT NULL,
+    end_date DATE,
+    principal NUMERIC(14,2) NOT NULL CHECK (principal > 0),
+    interest_rate NUMERIC(6,3) CHECK (interest_rate >= 0),
+    term_months INTEGER CHECK (term_months > 0),
+    currency TEXT DEFAULT 'USD',
+    status TEXT NOT NULL CHECK (status IN ('active', 'closed', 'defaulted', 'restructured')),
+    closed_reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Expected installments (scheduled tranches)
+CREATE TABLE IF NOT EXISTS installments (
+    installment_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    loan_id BIGINT NOT NULL REFERENCES loans(loan_id) ON DELETE CASCADE,
+    sequence_no INTEGER NOT NULL CHECK (sequence_no > 0),
+    due_date DATE NOT NULL,
+    amount_due NUMERIC(14,2) NOT NULL CHECK (amount_due >= 0),
+    principal_due NUMERIC(14,2) DEFAULT 0 CHECK (principal_due >= 0),
+    interest_due NUMERIC(14,2) DEFAULT 0 CHECK (interest_due >= 0),
+    fees_due NUMERIC(14,2) DEFAULT 0 CHECK (fees_due >= 0),
+    status TEXT NOT NULL CHECK (status IN ('due', 'paid', 'late', 'partial', 'waived')),
+    paid_amount NUMERIC(14,2) DEFAULT 0 CHECK (paid_amount >= 0),
+    paid_date DATE,
+    days_late INTEGER DEFAULT 0 CHECK (days_late >= 0),
+    is_restructured BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Actual payments made by the client
+CREATE TABLE IF NOT EXISTS payments (
+    payment_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    loan_id BIGINT NOT NULL REFERENCES loans(loan_id) ON DELETE CASCADE,
+    installment_id BIGINT REFERENCES installments(installment_id) ON DELETE SET NULL,
+    payment_date DATE NOT NULL,
+    amount_paid NUMERIC(14,2) NOT NULL CHECK (amount_paid > 0),
+    payment_method TEXT,
+    payment_channel TEXT,
+    status TEXT NOT NULL CHECK (status IN ('received', 'reversed', 'failed')),
+    is_reversal BOOLEAN NOT NULL DEFAULT FALSE,
+    external_ref TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Aggregated payment behavior for scoring
+CREATE TABLE IF NOT EXISTS payment_behavior_summary (
+    summary_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    loan_id BIGINT REFERENCES loans(loan_id) ON DELETE CASCADE,
+    period_start DATE,
+    period_end DATE,
+    total_installments INTEGER DEFAULT 0 CHECK (total_installments >= 0),
+    paid_installments INTEGER DEFAULT 0 CHECK (paid_installments >= 0),
+    missed_installments INTEGER DEFAULT 0 CHECK (missed_installments >= 0),
+    partial_installments INTEGER DEFAULT 0 CHECK (partial_installments >= 0),
+    on_time_rate NUMERIC(5,2) CHECK (on_time_rate >= 0 AND on_time_rate <= 100),
+    avg_days_late NUMERIC(6,2) CHECK (avg_days_late >= 0),
+    max_days_late INTEGER DEFAULT 0 CHECK (max_days_late >= 0),
+    total_amount_due NUMERIC(14,2) DEFAULT 0 CHECK (total_amount_due >= 0),
+    total_amount_paid NUMERIC(14,2) DEFAULT 0 CHECK (total_amount_paid >= 0),
+    outstanding_amount NUMERIC(14,2) DEFAULT 0 CHECK (outstanding_amount >= 0),
+    last_payment_date DATE,
+    last_missed_date DATE,
+    behavior_score NUMERIC(6,2),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_loans_user_status ON loans(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_installments_loan_due ON installments(loan_id, due_date);
+CREATE INDEX IF NOT EXISTS idx_payments_loan_date ON payments(loan_id, payment_date);
+CREATE INDEX IF NOT EXISTS idx_behavior_summary_user ON payment_behavior_summary(user_id);

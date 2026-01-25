@@ -70,6 +70,16 @@ export const AgentChatPanel = ({ requestId, agentName }: Props) => {
             }}
           >
             <div style={{ whiteSpace: "pre-wrap" }}>{msg.content}</div>
+            {msg.structured_output && msg.role === "agent" && (
+              <div style={{ marginTop: 6 }}>
+                <details>
+                  <summary style={{ cursor: "pointer", color: "#64748b" }}>Voir données</summary>
+                  <pre style={{ whiteSpace: "pre-wrap", fontSize: 12, color: "#475569" }}>
+                    {JSON.stringify(msg.structured_output, null, 2)}
+                  </pre>
+                </details>
+              </div>
+            )}
           </div>
         ))}
       </div>

@@ -69,9 +69,10 @@ def _aggregate_signals(payload: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     beh_flags = _safe_list(payload.get("behavior_flags"))
     txn_flags = _safe_list(payload.get("transaction_flags"))
     img_flags = _safe_list(payload.get("image_flags"))
+    sim_flags = _safe_list(payload.get("similarity_flags"))
 
-    supporting.extend(doc_flags + beh_flags + txn_flags + img_flags)
-    detected.extend(doc_flags + txn_flags + img_flags)
+    supporting.extend(doc_flags + beh_flags + txn_flags + img_flags + sim_flags)
+    detected.extend(doc_flags + txn_flags + img_flags + sim_flags)
 
     # Dedup
     def dedup(items: List[str]) -> List[str]:
@@ -314,7 +315,7 @@ def analyze_fraud(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Run fraud detection pipeline on provided signals payload.
 
     Expected payload keys: case_id, document_flags, behavior_flags, transaction_flags,
-    image_flags, and optional free_text list for regex extraction.
+    image_flags, similarity_flags, and optional free_text list for regex extraction.
     """
 
     case_id = payload.get("case_id")

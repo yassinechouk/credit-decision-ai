@@ -234,6 +234,19 @@ def _derive_reason_codes(
     return list(dict.fromkeys(reason_codes))
 
 
+def _compute_projected_debt_ratio(request_data: Dict[str, Any]) -> float:
+    monthly_income = float(request_data.get("monthly_income", 0.0) or 0.0)
+    other_income = float(request_data.get("other_income", 0.0) or 0.0)
+    total_income = monthly_income + other_income
+    monthly_charges = float(request_data.get("monthly_charges", 0.0) or 0.0)
+    loan_amount = float(request_data.get("amount", request_data.get("loan_amount", 0.0)) or 0.0)
+    loan_duration = float(request_data.get("duration_months", request_data.get("loan_duration", 0.0)) or 0.0)
+    monthly_payment = loan_amount / loan_duration if loan_duration > 0 else 0.0
+    if total_income <= 0:
+        return 0.0
+    return ((monthly_charges + monthly_payment) / total_income) * 100
+
+
 def _normalize_decision_label(label: str) -> str:
     mapping = {
         "APPROVE": "approve",
@@ -407,12 +420,26 @@ def run_orchestrator(request_data: Dict[str, Any]) -> Dict[str, Any]:
     behavior_flags = _safe_list(behavior_result.get("behavior_analysis", {}).get("behavior_flags", []))
     image_flags = _merge_flags(request_image_flags, image_result.get("image_analysis", {}).get("flags", []))
 
+    sim_analysis = sim_result.get("ai_analysis", {}) if isinstance(sim_result, dict) else {}
+    sim_red_flags = _safe_list(sim_analysis.get("red_flags", []))
+    sim_risk_level = str(sim_analysis.get("risk_level", "")).lower()
+    similarity_flags: List[str] = []
+    if sim_risk_level in {"eleve", "high"}:
+        similarity_flags.append("PEER_RISK_HIGH")
+    similarity_flags.extend(sim_red_flags)
+
+    projected_ratio = _compute_projected_debt_ratio(request_data)
+    txn_flags = _safe_list(request_data.get("transaction_flags", []))
+    if projected_ratio >= 45:
+        txn_flags.append("HIGH_DTI")
+
     fraud_payload = {
         "case_id": case_id,
         "document_flags": doc_flags,
         "behavior_flags": behavior_flags,
-        "transaction_flags": _safe_list(request_data.get("transaction_flags", [])),
+        "transaction_flags": txn_flags,
         "image_flags": image_flags,
+        "similarity_flags": similarity_flags,
         "free_text": _safe_list(request_data.get("free_text", [])),
     }
 

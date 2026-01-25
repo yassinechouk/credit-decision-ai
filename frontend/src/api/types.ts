@@ -93,6 +93,9 @@ export interface CreditRequest {
   agents?: AgentBundle;
   decision?: DecisionInfo;
   comments?: Comment[];
+  auto_decision?: string;
+  auto_decision_confidence?: number;
+  auto_review_required?: boolean;
 }
 
 export interface BankerRequest {
@@ -119,12 +122,16 @@ export interface BankerRequest {
   agents?: AgentBundle;
   comments?: Comment[];
   decision?: DecisionInfo;
+  auto_decision?: string;
+  auto_decision_confidence?: number;
+  auto_review_required?: boolean;
 }
 
 export interface AgentChatMessage {
   role: "banker" | "agent";
   content: string;
   created_at: string;
+  structured_output?: Record<string, unknown>;
 }
 
 export interface AgentChatRequest {

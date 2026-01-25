@@ -98,6 +98,51 @@ def _llm_client():
         return None
 
 
+def _llm_extract_fields(doc_summary: str) -> Dict[str, Any]:
+    client = _llm_client()
+    if not client or not doc_summary.strip():
+        return {}
+
+    prompt = f"""
+Tu es un extracteur documentaire. Extrait si possible:
+- income_documented (nombre)
+- contract_type_detected (permanent/temporary/freelance)
+- seniority_detected_years (entier)
+
+Texte:
+{doc_summary[:2000]}
+
+Reponds en JSON: {{"income_documented": 0, "contract_type_detected": "", "seniority_detected_years": 0}}
+Si absent, mets null.
+"""
+    try:
+        resp = client.responses.create(model=LLM_MODEL, input=prompt, max_output_tokens=200)
+        content = resp.output_text
+    except Exception:
+        try:
+            chat = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200,
+            )
+            content = chat.choices[0].message.content  # type: ignore[index]
+        except Exception:
+            return {}
+
+    import json
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, dict):
+            return {
+                "income_documented": parsed.get("income_documented"),
+                "contract_type_detected": parsed.get("contract_type_detected"),
+                "seniority_detected_years": parsed.get("seniority_detected_years"),
+            }
+    except Exception:
+        return {}
+    return {}
+
+
 def _generate_llm_explanations(flags: List[str], extracted: Dict[str, Any], declared: Dict[str, Any], doc_summary: str) -> Dict[str, Any]:
     client = _llm_client()
     if not client:
@@ -242,13 +287,21 @@ def _node_extract(state: DocumentState) -> DocumentState:
         "contract_type_detected": contract_detected,
         "seniority_detected_years": seniority_detected,
     }
+    doc_summary = "\n".join(summaries[:5])
+
+    if not any(extracted_fields.values()) and doc_summary.strip():
+        llm_extracted = _llm_extract_fields(doc_summary)
+        if isinstance(llm_extracted, dict):
+            for key, value in llm_extracted.items():
+                if extracted_fields.get(key) in (None, "", 0) and value not in (None, "", 0):
+                    extracted_fields[key] = value
 
     return {
         **state,
         "extracted_fields": extracted_fields,
         "missing_documents": missing_documents,
         "suspicious_patterns": list(dict.fromkeys(suspicious_patterns)),
-        "doc_summary": "\n".join(summaries[:5]),
+        "doc_summary": doc_summary,
     }
 
 
@@ -277,7 +330,7 @@ def _node_flags(state: DocumentState) -> DocumentState:
         if abs(seniority_detected - declared_seniority) > 1:
             flags.append("SENIORITY_MISMATCH")
 
-    if not any(extracted.values()):
+    if not any(extracted.values()) and not state.get("doc_summary"):
         flags.append("MISSING_KEY_FIELDS")
 
     if state.get("missing_documents"):
@@ -403,5 +456,4 @@ def analyze_documents(request: Dict[str, Any]) -> Dict[str, Any]:
     state = _node_llm_explain(state)
     state = _node_finalize(state)
     return state.get("output", {})
-
 

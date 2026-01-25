@@ -39,20 +39,90 @@ from core.db import (
     list_cases_for_client,
     save_orchestration,
     add_case_documents,
+    get_agent_session,
+    upsert_agent_session,
+    ensure_agent_session_snapshot,
 )
-from agents.chat_agent import generate_agent_reply
+from agents.chat_agent import generate_agent_reply, build_initial_agent_reply
 
 
 router = APIRouter(prefix="/api")
 
 
-_agent_chats: Dict[str, Dict[str, list[AgentChatMessage]]] = {}
 UPLOAD_ROOT = os.getenv("UPLOAD_DIR", "/app/data/uploads")
 
 
 def _require_role(user: Dict[str, Any], role: str) -> None:
     if user.get("role") != role:
         raise HTTPException(status_code=403, detail="Forbidden")
+
+
+def _parse_json_field(raw: str) -> Any:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
+
+
+def _infer_doc_type(filename: str) -> str:
+    lower = filename.lower()
+    if "salary" in lower or "pay" in lower or "bulletin" in lower or "payslip" in lower:
+        return "salary_slip"
+    if "contract" in lower or "contrat" in lower:
+        return "employment_contract"
+    if "bank" in lower or "statement" in lower or "releve" in lower:
+        return "bank_statement"
+    return "other"
+
+
+def _extract_pdf_text(content: bytes) -> str:
+    try:
+        from PyPDF2 import PdfReader  # type: ignore
+    except Exception:
+        return ""
+    try:
+        import io
+        reader = PdfReader(io.BytesIO(content))
+        pages = []
+        for page in reader.pages:
+            pages.append(page.extract_text() or "")
+        return "\n".join(pages).strip()
+    except Exception:
+        return ""
+
+
+async def _store_files(case_id: int, files: Optional[List[UploadFile]]) -> List[Dict[str, Any]]:
+    if not files:
+        return []
+    case_dir = Path(UPLOAD_ROOT) / str(case_id)
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    stored: List[Dict[str, Any]] = []
+    for upload in files:
+        raw = await upload.read()
+        filename = upload.filename or f"document-{uuid4()}.pdf"
+        safe_name = filename.replace("..", ".").replace("/", "_")
+        file_path = case_dir / safe_name
+        file_path.write_bytes(raw)
+
+        file_hash = hashlib.sha256(raw).hexdigest()
+        text = ""
+        if safe_name.lower().endswith(".pdf"):
+            text = _extract_pdf_text(raw)
+        else:
+            try:
+                text = raw.decode("utf-8")
+            except Exception:
+                text = ""
+
+        stored.append({
+            "document_type": _infer_doc_type(safe_name),
+            "file_path": str(file_path),
+            "file_hash": file_hash,
+            "filename": safe_name,
+            "raw_text": text,
+        })
+    return stored
 
 
 def _map_status(db_status: str, decision_row: Optional[Dict[str, Any]]) -> str:
@@ -149,9 +219,44 @@ def _map_comments(comment_rows: List[Dict[str, Any]]) -> List[Comment]:
     ]
 
 
-def _get_chat_messages(req_id: str, agent_name: str) -> list[AgentChatMessage]:
-    agent_bucket = _agent_chats.setdefault(req_id, {})
-    return agent_bucket.setdefault(agent_name, [])
+def _build_agents_raw(detail: Dict[str, Any]) -> Dict[str, Any]:
+    mapping = {
+        "document": "document_agent",
+        "similarity": "similarity_agent",
+        "behavior": "behavior_agent",
+        "fraud": "fraud_agent",
+        "image": "image_agent",
+    }
+    agents_raw: Dict[str, Any] = {}
+    for row in detail.get("agent_outputs", []) or []:
+        name = row.get("agent_name")
+        key = mapping.get(name, name)
+        output = row.get("output_json") or {}
+        if isinstance(output, str):
+            try:
+                output = json.loads(output)
+            except Exception:
+                output = {"summary": output}
+        agents_raw[key] = output
+    return agents_raw
+
+
+def _build_chat_snapshot(detail: Dict[str, Any]) -> Dict[str, Any]:
+    snapshot = _build_banker_request(detail).model_dump(mode="json")
+    snapshot["agents_raw"] = _build_agents_raw(detail)
+    snapshot["orchestrator"] = {
+        "proposed_decision": detail.get("auto_decision"),
+        "decision_confidence": detail.get("auto_decision_confidence"),
+        "human_review_required": detail.get("auto_review_required"),
+    }
+    return snapshot
+
+
+def _prime_agent_sessions(detail: Dict[str, Any]) -> None:
+    case_id = int(detail["case_id"])
+    snapshot = _build_chat_snapshot(detail)
+    for agent_name in ("document", "behavior", "similarity", "fraud", "image"):
+        ensure_agent_session_snapshot(case_id, agent_name, snapshot)
 
 
 def _parse_json_field(raw: Optional[str]) -> Any:
@@ -213,6 +318,9 @@ def _build_banker_request(detail: Dict[str, Any]) -> BankerRequest:
         updated_at=detail["updated_at"],
         client_id=str(detail["user_id"]),
         summary=detail.get("summary"),
+        auto_decision=detail.get("auto_decision"),
+        auto_decision_confidence=float(detail["auto_decision_confidence"]) if detail.get("auto_decision_confidence") is not None else None,
+        auto_review_required=detail.get("auto_review_required"),
         amount=float(detail["loan_amount"]),
         duration_months=int(detail["loan_duration"]),
         monthly_income=float(detail["monthly_income"]),
@@ -259,10 +367,21 @@ def login(body: LoginRequest):
 @router.post("/client/credit-requests", response_model=CreditRequest)
 def create_credit_request(body: CreditRequestCreate, user=Depends(get_current_user)):
     _require_role(user, "client")
-    created = create_credit_request_db(user["user_id"], body.model_dump(), None)
+    payload_data = body.model_dump()
+    documents_payloads = [
+        {"doc_type": _infer_doc_type(name), "raw_text": "", "filename": name}
+        for name in (payload_data.get("documents") or [])
+    ]
+    if documents_payloads:
+        payload_data = {**payload_data, "documents_payloads": documents_payloads}
+
+    created = create_credit_request_db(user["user_id"], payload_data, None)
     case_id = int(created["case_id"])
-    orchestration = run_orchestrator({**body.model_dump(), "case_id": case_id})
+    orchestration = run_orchestrator({**payload_data, "case_id": case_id})
     save_orchestration(case_id, orchestration)
+    banker_detail = fetch_case_detail(case_id)
+    if banker_detail:
+        _prime_agent_sessions(banker_detail)
     detail = fetch_case_detail_for_client(created["case_id"], user["user_id"])
     if not detail:
         raise HTTPException(status_code=500, detail="Failed to create request")
@@ -278,6 +397,9 @@ def create_credit_request(body: CreditRequestCreate, user=Depends(get_current_us
         agents=_map_agent_outputs(detail.get("agent_outputs", [])),
         decision=decision_info,
         comments=_map_comments(detail.get("comments", [])),
+        auto_decision=detail.get("auto_decision"),
+        auto_decision_confidence=float(detail["auto_decision_confidence"]) if detail.get("auto_decision_confidence") is not None else None,
+        auto_review_required=detail.get("auto_review_required"),
     )
 
 
@@ -300,9 +422,24 @@ async def create_credit_request_upload(
 
     if stored_documents:
         add_case_documents(case_id, stored_documents)
-        payload_data = {**payload_data, "documents": stored_documents}
+        documents_payloads = [
+            {
+                "doc_type": doc.get("document_type"),
+                "raw_text": doc.get("raw_text") or "",
+                "filename": doc.get("filename"),
+            }
+            for doc in stored_documents
+        ]
+        payload_data = {
+            **payload_data,
+            "documents_payloads": documents_payloads,
+            "documents": [doc.get("filename") for doc in stored_documents],
+        }
     orchestration = run_orchestrator({**payload_data, "case_id": case_id})
     save_orchestration(case_id, orchestration)
+    banker_detail = fetch_case_detail(case_id)
+    if banker_detail:
+        _prime_agent_sessions(banker_detail)
 
     detail = fetch_case_detail_for_client(created["case_id"], user["user_id"])
     if not detail:
@@ -319,6 +456,9 @@ async def create_credit_request_upload(
         agents=_map_agent_outputs(detail.get("agent_outputs", [])),
         decision=decision_info,
         comments=_map_comments(detail.get("comments", [])),
+        auto_decision=detail.get("auto_decision"),
+        auto_decision_confidence=float(detail["auto_decision_confidence"]) if detail.get("auto_decision_confidence") is not None else None,
+        auto_review_required=detail.get("auto_review_required"),
     )
 
 
@@ -339,6 +479,9 @@ def get_credit_request(req_id: str, user=Depends(get_current_user)):
         agents=_map_agent_outputs(detail.get("agent_outputs", [])),
         decision=_map_decision(detail.get("decision")),
         comments=_map_comments(detail.get("comments", [])),
+        auto_decision=detail.get("auto_decision"),
+        auto_decision_confidence=float(detail["auto_decision_confidence"]) if detail.get("auto_decision_confidence") is not None else None,
+        auto_review_required=detail.get("auto_review_required"),
     )
 
 
@@ -362,6 +505,9 @@ def list_client_requests(user=Depends(get_current_user)):
                 agents=_map_agent_outputs(detail.get("agent_outputs", [])),
                 decision=_map_decision(detail.get("decision")),
                 comments=_map_comments(detail.get("comments", [])),
+                auto_decision=detail.get("auto_decision"),
+                auto_decision_confidence=float(detail["auto_decision_confidence"]) if detail.get("auto_decision_confidence") is not None else None,
+                auto_review_required=detail.get("auto_review_required"),
             )
         )
     return results
@@ -434,6 +580,7 @@ async def upload_case_documents(
     if refreshed:
         orchestration = run_orchestrator(refreshed)
         save_orchestration(int(req_id), orchestration)
+        _prime_agent_sessions(refreshed)
 
     final_detail = fetch_case_detail(int(req_id))
     if not final_detail:
@@ -463,7 +610,23 @@ def get_agent_chat(req_id: str, agent_name: str, user: Dict = Depends(get_curren
     detail = fetch_case_detail(int(req_id))
     if not detail:
         raise HTTPException(status_code=404, detail="Credit request not found")
-    messages = _get_chat_messages(req_id, agent_name)
+    agent_name = agent_name.lower().strip()
+    session = get_agent_session(int(req_id), agent_name)
+    snapshot = session.get("snapshot_json") if session else _build_chat_snapshot(detail)
+    messages_payload = (session.get("messages_json") or []) if session else []
+    messages: List[AgentChatMessage] = [
+        AgentChatMessage(**msg) for msg in messages_payload if isinstance(msg, dict)
+    ]
+    if not messages:
+        initial_payload = build_initial_agent_reply(agent_name, snapshot)
+        initial_message = AgentChatMessage(
+            role="agent",
+            content=str(initial_payload.get("summary", "")),
+            structured_output=initial_payload.get("structured_output"),
+            created_at=datetime.now(timezone.utc),
+        )
+        messages = [initial_message]
+        upsert_agent_session(int(req_id), agent_name, snapshot, [m.model_dump() for m in messages])
     return AgentChatResponse(agent_name=agent_name, messages=messages)
 
 
@@ -478,19 +641,43 @@ def post_agent_chat(req_id: str, body: AgentChatRequest, user: Dict = Depends(ge
     if not agent_name:
         raise HTTPException(status_code=400, detail="agent_name is required")
 
-    messages = _get_chat_messages(req_id, agent_name)
+    session = get_agent_session(int(req_id), agent_name)
+    if session:
+        messages_payload = session.get("messages_json") or []
+        snapshot = session.get("snapshot_json") or _build_chat_snapshot(detail)
+    else:
+        messages_payload = []
+        snapshot = _build_chat_snapshot(detail)
+
+    messages: List[AgentChatMessage] = [
+        AgentChatMessage(**msg) for msg in messages_payload if isinstance(msg, dict)
+    ]
+    if not messages:
+        initial_payload = build_initial_agent_reply(agent_name, snapshot)
+        initial_message = AgentChatMessage(
+            role="agent",
+            content=str(initial_payload.get("summary", "")),
+            structured_output=initial_payload.get("structured_output"),
+            created_at=datetime.now(timezone.utc),
+        )
+        messages.append(initial_message)
     user_message = AgentChatMessage(role="banker", content=body.message, created_at=datetime.now(timezone.utc))
     messages.append(user_message)
 
     history_payload = [m.model_dump() for m in messages]
-    request_payload = _build_banker_request(detail).model_dump()
-    reply = generate_agent_reply(agent_name, request_payload, history_payload)
-    assistant_message = AgentChatMessage(role="agent", content=reply, created_at=datetime.now(timezone.utc))
+    reply_payload = generate_agent_reply(agent_name, snapshot, history_payload)
+    assistant_message = AgentChatMessage(
+        role="agent",
+        content=str(reply_payload.get("summary", "")),
+        structured_output=reply_payload.get("structured_output"),
+        created_at=datetime.now(timezone.utc),
+    )
     messages.append(assistant_message)
 
     if len(messages) > 50:
-        del messages[:-50]
+        messages = messages[-50:]
 
+    upsert_agent_session(int(req_id), agent_name, snapshot, [m.model_dump() for m in messages])
     return AgentChatResponse(agent_name=agent_name, messages=messages)
 
 
@@ -501,5 +688,8 @@ def rerun_agents(req_id: str, _: Dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Credit request not found")
     result = run_orchestrator(detail)
     save_orchestration(int(req_id), result)
+    refreshed = fetch_case_detail(int(req_id))
+    if refreshed:
+        _prime_agent_sessions(refreshed)
     agents = result.get("agents") or None
     return {"status": "ok", "agents": agents}

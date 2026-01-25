@@ -85,6 +85,7 @@ class AgentChatMessage(BaseModel):
     role: Literal["banker", "agent"]
     content: str
     created_at: datetime
+    structured_output: Optional[Dict[str, Any]] = None
 
 
 class AgentChatRequest(BaseModel):
@@ -124,6 +125,9 @@ class CreditRequest(BaseModel):
     agents: Optional[AgentBundle] = None
     decision: Optional[DecisionInfo] = None
     comments: List[Comment] = Field(default_factory=list)
+    auto_decision: Optional[str] = None
+    auto_decision_confidence: Optional[float] = None
+    auto_review_required: Optional[bool] = None
 
 
 class BankerRequest(BaseModel):
@@ -150,3 +154,6 @@ class BankerRequest(BaseModel):
     agents: Optional[AgentBundle] = None
     comments: List[Comment] = Field(default_factory=list)
     decision: Optional[DecisionInfo] = None
+    auto_decision: Optional[str] = None
+    auto_decision_confidence: Optional[float] = None
+    auto_review_required: Optional[bool] = None

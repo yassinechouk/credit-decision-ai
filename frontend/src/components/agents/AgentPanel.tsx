@@ -6,14 +6,33 @@ interface Props {
 }
 
 export const AgentPanel = ({ title, agent }: Props) => {
-  const customer = agent.explanations?.customer_explanation as
+  const rawExpl = agent.explanations;
+  let explanations = rawExpl as Exclude<AgentResult["explanations"], undefined>;
+  if (typeof rawExpl === "string") {
+    const trimmed = rawExpl.replace(/```json|```/gi, "").trim();
+    try {
+      explanations = JSON.parse(trimmed);
+    } catch {
+      explanations = { global_summary: trimmed };
+    }
+  } else if (rawExpl && typeof rawExpl === "object" && "flags" in rawExpl && !("flag_explanations" in rawExpl)) {
+    const flags = (rawExpl as { flags?: Record<string, string>; summary?: string }).flags || {};
+    explanations = {
+      flag_explanations: flags,
+      global_summary: (rawExpl as { summary?: string }).summary,
+    };
+  }
+
+  const customer = explanations?.customer_explanation as
     | { summary?: string; main_reasons?: string[]; next_steps?: string[] }
     | undefined;
-  const internal = agent.explanations?.internal_explanation as
+  const internal = explanations?.internal_explanation as
     | { summary?: string; main_reasons?: string[]; next_steps?: string[] }
     | undefined;
   const customerSummary = typeof customer?.summary === "string" ? customer.summary : undefined;
   const internalSummary = typeof internal?.summary === "string" ? internal.summary : undefined;
+  const flagMap = explanations?.flag_explanations || {};
+  const flagEntries = Object.entries(flagMap);
 
   return (
     <div className="card">
@@ -40,8 +59,8 @@ export const AgentPanel = ({ title, agent }: Props) => {
           </div>
         </div>
       )}
-      {agent.explanations?.global_summary && (
-        <p style={{ marginTop: 8, color: "#475569" }}>{agent.explanations.global_summary}</p>
+      {explanations?.global_summary && (
+        <p style={{ marginTop: 8, color: "#475569" }}>{explanations.global_summary}</p>
       )}
       {customerSummary && (
         <div style={{ marginTop: 8, color: "#475569" }}>
@@ -65,13 +84,13 @@ export const AgentPanel = ({ title, agent }: Props) => {
           <strong>Interne:</strong> {internalSummary}
         </div>
       )}
-      {agent.explanations?.flag_explanations && (
+      {flagEntries.length > 0 && (
         <div style={{ marginTop: 8 }}>
           <strong>Détails:</strong>
           <ul style={{ paddingLeft: 16 }}>
-            {Object.entries(agent.explanations.flag_explanations).map(([flag, desc]) => (
+            {flagEntries.map(([flag, desc]) => (
               <li key={flag} style={{ color: "#475569" }}>
-                <strong>{flag}:</strong> {desc}
+                <strong>{flag}:</strong> {String(desc)}
               </li>
             ))}
           </ul>
