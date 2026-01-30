@@ -4,160 +4,226 @@ AI-assisted credit decision support with multi-agent analysis and human-in-the-l
 
 ---
 
-## Project Overview
+## What this repo contains
 
-Credit Decision AI helps bankers and credit analysts evaluate loan applications using multiple independent AI agents. Each agent focuses on a specific perspective (risk, similarity, policy rules, fraud signals), and their outputs are combined to support a transparent recommendation rather than an automatic decision. The final approval or rejection remains human-driven.
-
-The system uses a backend API to orchestrate agents, persist their outputs, and present summaries to a banker-facing frontend. A vector database (Qdrant) provides similarity search on historical cases so analysts can compare the current request to comparable profiles and outcomes.
-
----
-
-## Key Features
-
-- Multi-agent credit analysis (risk, similarity, policy/rules, fraud/anomaly). *(Assumption / Planned for some agents)*
-- Qdrant similarity search on historical cases and repayment patterns.
-- Human-in-the-loop decision support with traceable signals.
-- Explainability via structured summaries and agent outputs.
-- Client history and repayment behavior usage. *(Assumption / Planned)*
+- **Backend (FastAPI):** orchestrates agents, stores credit cases, exposes REST APIs.
+- **Frontend (React/Vite):** client and banker workflows (login, requests, decisions).
+- **Vector search (Qdrant):** similarity lookup on historical credit cases.
+- **PostgreSQL:** source of truth for cases, decisions, payments, and agent outputs.
+- **Seed + synthetic data:** optional dataset for demos and similarity search.
 
 ---
 
-## System Architecture
+## Quickstart (Docker Compose)
 
-### High-level components
-
-- **Frontend:** client and banker interfaces.
-- **Backend (FastAPI):** request handling, orchestration, and persistence.
-- **Multi-agent layer:** independent agents run in parallel and return separate results.
-- **Database (PostgreSQL):** structured storage for cases, agent outputs, and decisions.
-- **Vector database (Qdrant):** similarity search over embeddings.
-
-### Architecture Diagram
+1) **Create env file**
 
 ```
-┌────────────────────┐              ┌───────────────────┐
-│  Client Frontend   │◄────────────►│   Backend API     │
-│  (React/Vite)      │              │   (FastAPI)       │
-└────────────────────┘              └─────────┬─────────┘
-                                              │
-                                              ▼
-                                ┌─────────────────────────┐
-                                │   Multi-Agent Layer     │
-                                │  (independent agents)   │
-                                └────────────┬────────────┘
-                                             │
-        ┌────────────────┬───────────────────┼───────────────────┬────────────────┐
-        │                │                   │                   │                │
-        ▼                ▼                   ▼                   ▼                ▼
-  ┌──────────┐   ┌─────────────┐   ┌──────────────┐   ┌──────────────┐   ┌────────────┐
-  │   Risk   │   │ Similarity  │   │ Rule/Policy  │   │    Fraud     │   │   Image    │
-  │  Agent   │   │   Agent     │   │    Agent     │   │    Agent     │   │   Agent    │
-  └─────┬────┘   └──────┬──────┘   └──────┬───────┘   └──────┬───────┘   └─────┬──────┘
-        │               │                  │                  │                  │
-        └───────────────┴──────────────────┴──────────────────┴──────────────────┘
-                                             │
-                                             ▼
-                              ┌──────────────────────────────┐
-                              │   PostgreSQL                 │
-                              │   (cases, history)           │
-                              └──────────────┬───────────────┘
-                                             │
-                                             ▼
-                              ┌──────────────────────────────┐
-                              │   Qdrant Vector DB           │
-                              └──────────────────────────────┘
+cp .env.example .env
+```
 
-Banker ──► Chat UI ──► Agents ──► Qdrant + Database (Assumption / Planned)
+Fill in `OPENAI_API_KEY` if you want LLM-powered agents (optional). Defaults use an OpenAI-compatible base URL.
+
+2) **Start services**
+
+```
+docker compose up --build
+```
+
+3) **Initialize database schema (first run only)**
+
+Use the minimal base schema so the backend can create the payment tables on startup:
+
+```
+docker compose exec -T postgres psql -U postgres -d credit < data/sql/schema.sql
+```
+
+4) **Optional: apply migrations**
+
+```
+for f in migrations/*.sql; do
+  docker compose exec -T postgres psql -U postgres -d credit < "$f"
+done
+```
+
+5) **Optional: seed the database**
+
+```
+DB_HOST=localhost DB_PORT=5432 DB_NAME=credit DB_USER=postgres DB_PASSWORD=postgres \
+  python seed_database.py
+```
+
+6) **Optional: load synthetic dataset into Qdrant**
+
+```
+docker compose exec backend python /app/data/synthetic/loadtoqdrant.py
+```
+
+**Ports**
+- Backend: `http://localhost:8000`
+- Frontend: `http://localhost:4173`
+- Qdrant: `http://localhost:6333`
+- Postgres: `localhost:5432`
+
+FastAPI docs are available at `http://localhost:8000/docs`.
+
+---
+
+## Local development (without Docker)
+
+### Backend
+
+```
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
+
+### Frontend
+
+```
+cd frontend
+npm install
+npm run dev
+```
+
+### Qdrant
+
+Run locally (example):
+
+```
+docker run -p 6333:6333 qdrant/qdrant:v1.9.1
 ```
 
 ---
 
-## Qdrant Integration
+## Configuration
 
-Qdrant is used to retrieve similar historical cases so analysts can compare a new application to past outcomes. The Similarity Agent builds embeddings from a credit profile summary and queries a Qdrant collection named `credit_dataset` using cosine similarity. The default embedding model is `all-MiniLM-L6-v2` (configurable via environment variables).
+Main environment variables (see `.env.example`):
 
-### Current usage
-
-- Embedding of credit profile summaries.
-- Qdrant collection: `credit_dataset`.
-- Similarity search for top-k comparable cases.
-
-### Possible future extensions *(Assumption / Planned)*
-
-- Embeddings for repayment behavior summaries (late payments, defaults).
-- Similarity search over client history and installment patterns.
-
----
-
-## Data Flow / Pipeline
-
-1. **Input:** client application data and documents.
-2. **Cleaning:** validate numeric ranges and normalize categorical fields.
-3. **Feature extraction:** structured features for rule-based checks.
-4. **Embeddings:** transform profile summaries into vectors.
-5. **Storage:** PostgreSQL for structured data, Qdrant for vectors.
-6. **Agent inference:** independent agent scoring and explanations.
-7. **Banker review:** human validation of AI signals and final decision.
+- `OPENAI_API_KEY`: enables LLM-backed agents (optional).
+- `OPENAI_BASE_URL`: OpenAI-compatible endpoint (default: Groq).
+- `LLM_MODEL`: default `llama-3.3-70b-versatile`.
+- `QDRANT_URL`: default `http://localhost:6333`.
+- `QDRANT_API_KEY`: optional.
+- `QDRANT_COLLECTION_NAME`: default `credit_dataset`.
+- `QDRANT_AUTO_LOAD`: set to `1` to auto-load dataset into Qdrant on startup.
+- `SIMILARITY_DATASET_PATH`: path to `credit_dataset.json`.
+- `EMBEDDING_MODEL`: default `sentence-transformers/all-MiniLM-L6-v2`.
+- `TOP_K_SIMILAR`: number of similar cases returned (default 10).
+- `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`.
+- `UPLOAD_DIR`: where uploaded documents are stored (default `/app/data/uploads`).
 
 ---
 
-## Multi-Agent Design
+## API overview
 
-- **Risk Agent:** evaluates overall risk and debt ratios. *(Assumption / Planned)*
-- **Similarity Agent (Qdrant):** retrieves comparable cases and statistics.
-- **Rule / Policy Agent:** checks policy constraints and eligibility rules. *(Assumption / Planned)*
-- **Fraud / Anomaly Agent:** flags suspicious patterns. *(Present / Planned depending on dataset)*
+Authentication uses a simple bearer token returned by `/api/auth/login`.
 
-Agents run independently and their outputs are aggregated into a single recommendation for the banker.
+Key endpoints:
+
+- `POST /api/auth/login`
+- `POST /api/client/credit-requests`
+- `POST /api/client/credit-requests/upload` (multipart with files)
+- `GET /api/client/credit-requests`
+- `GET /api/client/credit-requests/{id}`
+- `GET /api/banker/credit-requests`
+- `GET /api/banker/credit-requests/{id}`
+- `POST /api/banker/credit-requests/{id}/decision`
+- `POST /api/banker/credit-requests/{id}/decision-suggestion`
+- `POST /api/banker/credit-requests/{id}/rerun`
+- `POST /api/banker/credit-requests/{id}/agent-chat`
+
+### Example flow
+
+```
+# Login (seeded demo users)
+# client1@test.com / hashed-password
+# banker1@test.com / hashed-password
+curl -X POST http://localhost:8000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"client1@test.com","password":"hashed-password"}'
+
+# Create a credit request (replace TOKEN)
+curl -X POST http://localhost:8000/api/client/credit-requests \
+  -H 'Authorization: Bearer TOKEN' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "amount": 12000,
+    "duration_months": 36,
+    "monthly_income": 2500,
+    "monthly_charges": 900,
+    "employment_type": "employee",
+    "contract_type": "permanent",
+    "seniority_years": 3,
+    "family_status": "single"
+  }'
+```
+
+Sample documents are available in `data/sample_docs/`.
 
 ---
 
-## Banker Interaction
+## Multi-agent design
 
-Bankers review the AI-generated summary, inspect similar past cases, and assess risk explanations. A chat-style interface can allow bankers to ask questions such as "Why was this rejected?" or "Show similar cases." *(Assumption / Planned)* The intent is to maximize explainability and transparency while keeping the final decision human-driven.
+Agents run independently and return structured outputs that are aggregated into a recommendation:
 
----
+- **Document agent:** extracts signals from uploaded documents (LLM optional).
+- **Similarity agent:** compares the case to historical profiles using Qdrant.
+- **Behavior agent:** evaluates payment behavior signals (LLM optional).
+- **Fraud agent:** flags anomalies (LLM optional).
+- **Decision + Explanation agents:** consolidate signals into a recommendation and explanation.
+- **Image agent:** stub heuristics for document quality (no real CV yet).
 
-## Project Status & Roadmap
-
-### Implemented / Available
-
-- Backend API for credit requests and orchestration.
-- Similarity Agent with Qdrant integration.
-- PostgreSQL persistence for cases and agent outputs.
-
-### In Progress
-
-- Banker workspace enhancements.
-- Extended similarity analytics.
-
-### Planned
-
-- Full policy/rule agent.
-- Banker–agent chat interface.
-- Client history and installment-level analytics.
+If `OPENAI_API_KEY` is not provided, agents fall back to heuristic or stub behavior.
 
 ---
 
-## Repository Structure
+## Frontends
+
+- `frontend/`: primary React app for clients and bankers.
+- `uiuxcredit2/`: UI/UX prototype bundle (standalone Vite app).
+
+---
+
+## Testing
+
+Backend:
+
+```
+cd backend
+pytest
+```
+
+Frontend:
+
+```
+cd frontend
+npm run test:e2e
+```
+
+---
+
+## Repository structure
 
 ```
 ├── backend/              FastAPI backend, agents, orchestration, tests
-├── frontend/             React/Vite frontend
-├── data/                 Synthetic datasets and SQL schema files
+├── frontend/             React/Vite app (client + banker flows)
+├── uiuxcredit2/          UI/UX prototype bundle
+├── data/                 Synthetic datasets + sample docs
+├── data/sql/schema.sql   Minimal base schema
+├── migrations/           SQL migrations
 ├── docker-compose.yml    Local multi-service setup
-├── schema.sql            Database schema
+├── schema.sql            Full schema (optional)
 └── seed_database.py      Optional database seeding script
 ```
 
 ---
 
-## Technologies Used
+## Notes
 
-- Python
-- FastAPI
-- Qdrant
-- SentenceTransformers
-- PostgreSQL
-- React (Vite)
-- LangChain / LangGraph
+- This project is a decision-support system, not an automated approval engine.
+- Some agents are still heuristic or partial implementations.
+- Use in production requires additional validation, compliance, and security hardening.
