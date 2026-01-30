@@ -11,6 +11,7 @@ interface AuthState {
 }
 
 const STORAGE_KEY = "cdai_auth";
+const API_BASE = import.meta.env.VITE_API_URL || "/api";
 
 const load = () => {
   try {
@@ -22,7 +23,7 @@ const load = () => {
   }
 };
 
-export const useAuthStore = create<AuthState>((set) => ({
+export const useAuthStore = create<AuthState>((set, get) => ({
   token: load()?.token ?? null,
   role: load()?.role ?? null,
   userId: load()?.userId ?? null,
@@ -31,6 +32,16 @@ export const useAuthStore = create<AuthState>((set) => ({
     set({ token: data.token, role: data.role, userId: data.userId });
   },
   logout: () => {
+    const token = get().token;
+    if (token) {
+      fetch(`${API_BASE}/auth/logout`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+      }).catch(() => {});
+    }
     localStorage.removeItem(STORAGE_KEY);
     set({ token: null, role: null, userId: null });
   },

@@ -127,11 +127,39 @@ def init_db() -> None:
                         session_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
                         case_id BIGINT NOT NULL REFERENCES credit_cases(case_id) ON DELETE CASCADE,
                         agent_name TEXT NOT NULL,
+                        banker_id BIGINT,
                         snapshot_json JSONB NOT NULL DEFAULT '{}'::jsonb,
                         messages_json JSONB NOT NULL DEFAULT '[]'::jsonb,
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        UNIQUE (case_id, agent_name)
+                        UNIQUE (case_id, agent_name, banker_id)
                     )
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE agent_sessions
+                    ADD COLUMN IF NOT EXISTS banker_id BIGINT
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE agent_sessions
+                    DROP CONSTRAINT IF EXISTS agent_sessions_case_id_agent_name_key
+                    """
+                )
+                cur.execute(
+                    """
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_constraint
+                            WHERE conname = 'agent_sessions_case_id_agent_name_banker_id_key'
+                        ) THEN
+                            ALTER TABLE agent_sessions
+                            ADD CONSTRAINT agent_sessions_case_id_agent_name_banker_id_key
+                            UNIQUE (case_id, agent_name, banker_id);
+                        END IF;
+                    END$$;
                     """
                 )
                 cur.execute(
@@ -584,60 +612,98 @@ def save_orchestration(case_id: int, orchestration: Dict[str, Any]) -> None:
         conn.close()
 
 
-def get_agent_session(case_id: int, agent_name: str) -> Optional[Dict[str, Any]]:
+def get_agent_session(case_id: int, agent_name: str, banker_id: int) -> Optional[Dict[str, Any]]:
     conn = _connect()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT session_id, case_id, agent_name, snapshot_json, messages_json, updated_at
+                SELECT session_id, case_id, agent_name, banker_id, snapshot_json, messages_json, updated_at
                 FROM agent_sessions
-                WHERE case_id = %s AND agent_name = %s
+                WHERE case_id = %s AND agent_name = %s AND banker_id = %s
                 """,
-                (case_id, agent_name),
+                (case_id, agent_name, banker_id),
             )
             return cur.fetchone()
     finally:
         conn.close()
 
 
-def upsert_agent_session(case_id: int, agent_name: str, snapshot: Dict[str, Any], messages: List[Dict[str, Any]]) -> None:
+def upsert_agent_session(
+    case_id: int,
+    agent_name: str,
+    snapshot: Dict[str, Any],
+    messages: List[Dict[str, Any]],
+    banker_id: int,
+) -> None:
     conn = _connect()
     try:
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO agent_sessions (case_id, agent_name, snapshot_json, messages_json)
-                    VALUES (%s, %s, %s::jsonb, %s::jsonb)
-                    ON CONFLICT (case_id, agent_name)
+                    INSERT INTO agent_sessions (case_id, agent_name, banker_id, snapshot_json, messages_json)
+                    VALUES (%s, %s, %s, %s::jsonb, %s::jsonb)
+                    ON CONFLICT (case_id, agent_name, banker_id)
                     DO UPDATE SET
                         snapshot_json = EXCLUDED.snapshot_json,
                         messages_json = EXCLUDED.messages_json,
                         updated_at = NOW()
                     """,
-                    (case_id, agent_name, _json_dumps(snapshot), _json_dumps(messages)),
+                    (case_id, agent_name, banker_id, _json_dumps(snapshot), _json_dumps(messages)),
                 )
     finally:
         conn.close()
 
 
-def ensure_agent_session_snapshot(case_id: int, agent_name: str, snapshot: Dict[str, Any]) -> None:
+def ensure_agent_session_snapshot(case_id: int, agent_name: str, snapshot: Dict[str, Any], banker_id: int) -> None:
     conn = _connect()
     try:
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO agent_sessions (case_id, agent_name, snapshot_json)
-                    VALUES (%s, %s, %s::jsonb)
-                    ON CONFLICT (case_id, agent_name)
+                    INSERT INTO agent_sessions (case_id, agent_name, banker_id, snapshot_json)
+                    VALUES (%s, %s, %s, %s::jsonb)
+                    ON CONFLICT (case_id, agent_name, banker_id)
                     DO UPDATE SET
                         snapshot_json = EXCLUDED.snapshot_json,
                         updated_at = NOW()
                     """,
-                    (case_id, agent_name, _json_dumps(snapshot)),
+                    (case_id, agent_name, banker_id, _json_dumps(snapshot)),
                 )
+    finally:
+        conn.close()
+
+
+def clear_agent_sessions_for_banker(banker_id: int) -> int:
+    conn = _connect()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM agent_sessions
+                    WHERE banker_id = %s
+                    """,
+                    (banker_id,),
+                )
+                return cur.rowcount
+    finally:
+        conn.close()
+
+
+def clear_agent_sessions() -> int:
+    conn = _connect()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM agent_sessions
+                    """
+                )
+                return cur.rowcount
     finally:
         conn.close()
 
@@ -975,6 +1041,88 @@ def fetch_case_detail(case_id: int, include_payments: bool = True) -> Optional[D
         conn.close()
 
 
+def fetch_case_vector_sync(case_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Lightweight fetch for Postgres -> Qdrant sync.
+
+    Returns only the fields needed to build payload + embedding text.
+    """
+    conn = _connect()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    c.case_id,
+                    c.user_id,
+                    c.status,
+                    c.loan_amount,
+                    c.loan_duration,
+                    c.updated_at,
+                    f.monthly_income,
+                    f.other_income,
+                    f.monthly_charges,
+                    f.employment_type,
+                    f.contract_type,
+                    f.seniority_years,
+                    f.marital_status,
+                    f.number_of_children,
+                    f.spouse_employed,
+                    f.housing_status,
+                    f.is_primary_holder
+                FROM credit_cases c
+                JOIN financial_profile f ON f.case_id = c.case_id
+                WHERE c.case_id = %s
+                """,
+                (case_id,),
+            )
+            base = cur.fetchone()
+            if not base:
+                return None
+
+            cur.execute(
+                """
+                SELECT decision
+                FROM decisions
+                WHERE case_id = %s
+                """,
+                (case_id,),
+            )
+            decision = cur.fetchone()
+            base["decision"] = (decision or {}).get("decision")
+
+            cur.execute(
+                """
+                SELECT loan_id, status
+                FROM loans
+                WHERE case_id = %s
+                """,
+                (case_id,),
+            )
+            loan = cur.fetchone()
+            base["loan"] = loan
+
+            cur.execute(
+                """
+                SELECT summary_id, user_id, total_installments, on_time_installments,
+                       late_installments, missed_installments, on_time_rate, avg_days_late,
+                       max_days_late, last_payment_date, updated_at
+                FROM payment_behavior_summary
+                WHERE user_id = %s
+                """,
+                (base["user_id"],),
+            )
+            base["payment_behavior_summary"] = cur.fetchone()
+
+            # Derive defaulted from loan status if available.
+            loan_status = (loan or {}).get("status")
+            base["defaulted"] = str(loan_status or "").upper() == "DEFAULTED"
+
+            return base
+    finally:
+        conn.close()
+
+
 def fetch_case_detail_for_client(case_id: int, user_id: int, include_payments: bool = True) -> Optional[Dict[str, Any]]:
     conn = _connect()
     try:
@@ -1007,12 +1155,14 @@ def upsert_decision(case_id: int, decision: str, note: Optional[str], banker_id:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     """
-                    SELECT 1 FROM credit_cases WHERE case_id = %s
+                    SELECT user_id FROM credit_cases WHERE case_id = %s
                     """,
                     (case_id,),
                 )
-                if not cur.fetchone():
+                row = cur.fetchone()
+                if not row:
                     return None
+                user_id = int(row.get("user_id"))
                 cur.execute(
                     """
                     INSERT INTO decisions (case_id, decision, note, decided_by)
@@ -1038,6 +1188,8 @@ def upsert_decision(case_id: int, decision: str, note: Optional[str], banker_id:
                 )
                 if decision_upper == "APPROVE":
                     _ensure_loan_for_case(cur, case_id)
+                    # Loan/instalments creation impacts payment context: keep summary synced.
+                    _recompute_payment_behavior_summary_tx(cur, user_id)
                 return decision_row
     finally:
         conn.close()
@@ -1246,3 +1398,225 @@ def fetch_payment_context(user_id: int, case_id: Optional[int] = None) -> Dict[s
         "payments": payments,
         "payment_behavior_summary": summary,
     }
+
+
+def _recompute_payment_behavior_summary_tx(cur, user_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Recompute and upsert payment_behavior_summary inside an existing transaction.
+
+    This keeps "late/missed/on_time" derived from installments and payments in sync.
+    """
+    cur.execute("SELECT COUNT(*) AS total_loans FROM loans WHERE user_id = %s", (user_id,))
+    total_loans = int((cur.fetchone() or {}).get("total_loans") or 0)
+
+    cur.execute(
+        """
+        SELECT
+            COUNT(*) AS total_installments,
+            SUM(CASE WHEN i.status = 'PAID' AND COALESCE(i.days_late, 0) <= 0 THEN 1 ELSE 0 END) AS on_time_installments,
+            SUM(CASE WHEN i.status = 'MISSED' THEN 1 ELSE 0 END) AS missed_installments,
+            SUM(CASE WHEN (i.status = 'LATE') OR (i.status = 'PAID' AND COALESCE(i.days_late, 0) > 0) THEN 1 ELSE 0 END) AS late_installments,
+            AVG(CASE WHEN COALESCE(i.days_late, 0) > 0 THEN i.days_late END) AS avg_days_late,
+            MAX(COALESCE(i.days_late, 0)) AS max_days_late
+        FROM installments i
+        JOIN loans l ON l.loan_id = i.loan_id
+        WHERE l.user_id = %s
+        """,
+        (user_id,),
+    )
+    inst = cur.fetchone() or {}
+    total_installments = int(inst.get("total_installments") or 0)
+    on_time_installments = int(inst.get("on_time_installments") or 0)
+    late_installments = int(inst.get("late_installments") or 0)
+    missed_installments = int(inst.get("missed_installments") or 0)
+    avg_days_late = float(inst.get("avg_days_late") or 0)
+    max_days_late = int(inst.get("max_days_late") or 0)
+    on_time_rate = float(on_time_installments / total_installments) if total_installments > 0 else 0.0
+
+    cur.execute(
+        """
+        SELECT
+            AVG(p.amount) AS avg_payment_amount,
+            MAX(p.payment_date) AS last_payment_date
+        FROM payments p
+        JOIN loans l ON l.loan_id = p.loan_id
+        WHERE l.user_id = %s
+          AND p.status = 'COMPLETED'
+          AND p.is_reversal = FALSE
+        """,
+        (user_id,),
+    )
+    pay = cur.fetchone() or {}
+    avg_payment_amount = float(pay.get("avg_payment_amount") or 0)
+    last_payment_date = pay.get("last_payment_date")
+
+    cur.execute(
+        """
+        INSERT INTO payment_behavior_summary (
+            user_id,
+            total_loans,
+            total_installments,
+            on_time_installments,
+            late_installments,
+            missed_installments,
+            on_time_rate,
+            avg_days_late,
+            max_days_late,
+            avg_payment_amount,
+            last_payment_date,
+            updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        ON CONFLICT (user_id) DO UPDATE SET
+            total_loans = EXCLUDED.total_loans,
+            total_installments = EXCLUDED.total_installments,
+            on_time_installments = EXCLUDED.on_time_installments,
+            late_installments = EXCLUDED.late_installments,
+            missed_installments = EXCLUDED.missed_installments,
+            on_time_rate = EXCLUDED.on_time_rate,
+            avg_days_late = EXCLUDED.avg_days_late,
+            max_days_late = EXCLUDED.max_days_late,
+            avg_payment_amount = EXCLUDED.avg_payment_amount,
+            last_payment_date = EXCLUDED.last_payment_date,
+            updated_at = NOW()
+        RETURNING summary_id, user_id, total_loans, total_installments, on_time_installments,
+                  late_installments, missed_installments, on_time_rate, avg_days_late,
+                  max_days_late, avg_payment_amount, last_payment_date, updated_at
+        """,
+        (
+            user_id,
+            total_loans,
+            total_installments,
+            on_time_installments,
+            late_installments,
+            missed_installments,
+            on_time_rate,
+            avg_days_late,
+            max_days_late,
+            avg_payment_amount,
+            last_payment_date,
+        ),
+    )
+    return cur.fetchone()
+
+
+def recompute_payment_behavior_summary(user_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Public wrapper to recompute payment_behavior_summary for a user.
+    """
+    conn = _connect()
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                return _recompute_payment_behavior_summary_tx(cur, user_id)
+    finally:
+        conn.close()
+
+
+def create_payment_for_case(
+    case_id: int,
+    payment_date: date,
+    amount: float,
+    channel: str,
+    status: str,
+    installment_id: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Insert a payment for a case's loan and recompute payment_behavior_summary.
+
+    This is intentionally simple: it updates one installment when provided (or the next due),
+    then recomputes the user's aggregated payment summary.
+    """
+    conn = _connect()
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT loan_id, user_id
+                    FROM loans
+                    WHERE case_id = %s
+                    """,
+                    (case_id,),
+                )
+                loan = cur.fetchone()
+                if not loan:
+                    return None
+                loan_id = int(loan["loan_id"])
+                user_id = int(loan["user_id"])
+
+                # Pick an installment if not specified.
+                if installment_id is None:
+                    cur.execute(
+                        """
+                        SELECT installment_id
+                        FROM installments
+                        WHERE loan_id = %s AND status IN ('PENDING', 'LATE', 'MISSED')
+                        ORDER BY installment_number ASC
+                        LIMIT 1
+                        """,
+                        (loan_id,),
+                    )
+                    row = cur.fetchone()
+                    installment_id = int(row["installment_id"]) if row and row.get("installment_id") is not None else None
+
+                # Validate installment belongs to the loan.
+                installment_row = None
+                if installment_id is not None:
+                    cur.execute(
+                        """
+                        SELECT installment_id, due_date, amount_due, amount_paid
+                        FROM installments
+                        WHERE installment_id = %s AND loan_id = %s
+                        FOR UPDATE
+                        """,
+                        (installment_id, loan_id),
+                    )
+                    installment_row = cur.fetchone()
+                    if not installment_row:
+                        installment_id = None
+
+                cur.execute(
+                    """
+                    INSERT INTO payments (
+                        loan_id, installment_id, payment_date, amount, channel, status, is_reversal
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, FALSE)
+                    RETURNING payment_id, loan_id, installment_id, payment_date, amount, channel,
+                              status, is_reversal, reversal_of, created_at
+                    """,
+                    (loan_id, installment_id, payment_date, amount, channel, status),
+                )
+                payment = cur.fetchone()
+
+                # Best-effort update of installment stats.
+                if installment_row and installment_id is not None:
+                    due_date = installment_row.get("due_date")
+                    amount_due = float(installment_row.get("amount_due") or 0)
+                    amount_paid = float(installment_row.get("amount_paid") or 0)
+                    new_paid = amount_paid + float(amount)
+                    new_status = "PAID" if new_paid >= amount_due and amount_due > 0 else "PENDING"
+                    cur.execute(
+                        """
+                        UPDATE installments
+                        SET amount_paid = %s,
+                            paid_at = %s,
+                            days_late = GREATEST(0, (%s::date - due_date)),
+                            status = %s
+                        WHERE installment_id = %s
+                        """,
+                        (new_paid, payment_date, payment_date, new_status, installment_id),
+                    )
+
+                _recompute_payment_behavior_summary_tx(cur, user_id)
+                cur.execute(
+                    """
+                    UPDATE credit_cases
+                    SET updated_at = NOW()
+                    WHERE case_id = %s
+                    """,
+                    (case_id,),
+                )
+                return payment
+    finally:
+        conn.close()

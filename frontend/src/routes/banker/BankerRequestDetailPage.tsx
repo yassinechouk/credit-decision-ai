@@ -150,6 +150,8 @@ export const BankerRequestDetailPage = () => {
   const payments = data.payments || [];
   const paymentSummary = data.payment_behavior_summary;
 
+  const showDecisionForm = !data.decision || data.decision.decision === "review";
+
   return (
     <div className="banker-detail">
       <div className="detail-topbar">
@@ -377,49 +379,51 @@ export const BankerRequestDetailPage = () => {
                 ) : (
                   <p className="detail-muted">Aucune décision pour le moment.</p>
                 )}
-                <form onSubmit={submitDecision} className="grid" style={{ gap: 8, marginTop: 12 }}>
-                  <label>Choisir une décision</label>
-            <select
-              className="input"
-              value={decision}
-              onChange={(e) => {
-                setDecision(e.target.value as DecisionCreate["decision"]);
-                setNoteError(null);
-              }}
-            >
-              <option value="approve">Approuver</option>
-              <option value="reject">Refuser</option>
-              <option value="review">Revoir</option>
-            </select>
-            <label>Note</label>
-            <textarea className="input" value={note} onChange={(e) => setNote(e.target.value)} rows={3} />
-            {noteError && <div style={{ color: "#b91c1c", fontSize: 14 }}>{noteError}</div>}
-            {decision === "reject" && (
-              <button
-                className="button-ghost"
-                type="button"
-                onClick={() => fetchSuggestedNote("reject")}
-                style={{ justifySelf: "start" }}
-                disabled={suggesting}
-              >
-                {suggesting ? "Suggestion..." : "Suggérer une cause (AI)"}
-              </button>
-            )}
-            {decision === "review" && (
-              <button
-                className="button-ghost"
-                type="button"
-                onClick={() => fetchSuggestedNote("review")}
-                style={{ justifySelf: "start" }}
-                disabled={suggesting}
-              >
-                {suggesting ? "Suggestion..." : "Suggérer des actions (AI)"}
-              </button>
-            )}
-            <button className="button-primary" type="submit">
-              Enregistrer la décision
-            </button>
-                </form>
+                {showDecisionForm && (
+                  <form onSubmit={submitDecision} className="grid" style={{ gap: 8, marginTop: 12 }}>
+                    <label>Choisir une décision</label>
+                    <select
+                      className="input"
+                      value={decision}
+                      onChange={(e) => {
+                        setDecision(e.target.value as DecisionCreate["decision"]);
+                        setNoteError(null);
+                      }}
+                    >
+                      <option value="approve">Approuver</option>
+                      <option value="reject">Refuser</option>
+                      <option value="review">Revoir</option>
+                    </select>
+                    <label>Note</label>
+                    <textarea className="input" value={note} onChange={(e) => setNote(e.target.value)} rows={3} />
+                    {noteError && <div style={{ color: "#b91c1c", fontSize: 14 }}>{noteError}</div>}
+                    {decision === "reject" && (
+                      <button
+                        className="button-ghost"
+                        type="button"
+                        onClick={() => fetchSuggestedNote("reject")}
+                        style={{ justifySelf: "start" }}
+                        disabled={suggesting}
+                      >
+                        {suggesting ? "Suggestion..." : "Suggérer une cause (AI)"}
+                      </button>
+                    )}
+                    {decision === "review" && (
+                      <button
+                        className="button-ghost"
+                        type="button"
+                        onClick={() => fetchSuggestedNote("review")}
+                        style={{ justifySelf: "start" }}
+                        disabled={suggesting}
+                      >
+                        {suggesting ? "Suggestion..." : "Suggérer des actions (AI)"}
+                      </button>
+                    )}
+                    <button className="button-primary" type="submit">
+                      Enregistrer la décision
+                    </button>
+                  </form>
+                )}
               </div>
             ) : selectedAgentData ? (
               <AgentPanel title={`Agent ${AGENT_LABELS[selectedAgent] ?? selectedAgent}`} agent={selectedAgentData} />

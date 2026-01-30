@@ -122,6 +122,14 @@ class PaymentInfo(BaseModel):
     created_at: datetime
 
 
+class PaymentCreate(BaseModel):
+    payment_date: date
+    amount: float
+    channel: str = "bank_transfer"
+    status: str = "COMPLETED"
+    installment_id: Optional[int] = None
+
+
 class PaymentBehaviorSummary(BaseModel):
     summary_id: int
     user_id: int

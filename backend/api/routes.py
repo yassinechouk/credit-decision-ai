@@ -6,7 +6,7 @@ import json
 import os
 import hashlib
 from pathlib import Path
-from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import FileResponse
 
 from api.schemas import (
@@ -28,6 +28,7 @@ from api.schemas import (
     LoanInfo,
     InstallmentInfo,
     PaymentInfo,
+    PaymentCreate,
     PaymentBehaviorSummary,
 )
 from api.deps import get_current_user
@@ -46,9 +47,16 @@ from core.db import (
     get_agent_session,
     upsert_agent_session,
     ensure_agent_session_snapshot,
+    clear_agent_sessions_for_banker,
     resubmit_credit_request_db,
+    create_payment_for_case,
 )
 from agents.chat_agent import generate_agent_reply, build_initial_agent_reply
+
+try:
+    from services.vector_sync import sync_credit_case_to_qdrant  # type: ignore
+except Exception:  # pragma: no cover
+    sync_credit_case_to_qdrant = None  # type: ignore
 
 
 router = APIRouter(prefix="/api")
@@ -334,11 +342,13 @@ def _build_chat_snapshot(detail: Dict[str, Any]) -> Dict[str, Any]:
     return snapshot
 
 
-def _prime_agent_sessions(detail: Dict[str, Any]) -> None:
+def _prime_agent_sessions(detail: Dict[str, Any], banker_id: Optional[int] = None) -> None:
+    if banker_id is None:
+        return
     case_id = int(detail["case_id"])
     snapshot = _build_chat_snapshot(detail)
     for agent_name in ("document", "behavior", "similarity", "fraud", "image", "decision", "explanation"):
-        ensure_agent_session_snapshot(case_id, agent_name, snapshot)
+        ensure_agent_session_snapshot(case_id, agent_name, snapshot, banker_id)
 
 
 def _parse_json_field(raw: Optional[str]) -> Any:
@@ -350,8 +360,9 @@ def _parse_json_field(raw: Optional[str]) -> Any:
         return None
 
 
-def _infer_doc_type(filename: str) -> str:
+def _infer_doc_type(filename: str, raw_text: str = "") -> str:
     lower = filename.lower()
+    text = (raw_text or "").lower()
     if "salary" in lower or "pay" in lower or "bulletin" in lower or "payslip" in lower:
         return "salary_slip"
     if "contract" in lower or "contrat" in lower or "employment" in lower:
@@ -360,11 +371,59 @@ def _infer_doc_type(filename: str) -> str:
         return "bank_statement"
     if "invoice" in lower or "facture" in lower:
         return "invoice"
+
+    # Fallback: infer from extracted text when filename is generic (ex: 1.pdf).
+    if "fiche de paie" in text or "salaire" in text or "payslip" in text:
+        return "salary_slip"
+    if "contrat de travail" in text or "cdi" in text or "cdd" in text:
+        return "employment_contract"
+    if "relev" in text or "iban" in text or "banque" in text:
+        return "bank_statement"
     return "uploaded"
 
 
 def _safe_filename(name: str) -> str:
     return os.path.basename(name).replace("\\", "/").split("/")[-1]
+
+
+def _hydrate_documents(detail: Dict[str, Any]) -> None:
+    """
+    Ensure documents in detail include raw_text and inferred document_type,
+    even if filenames are generic (ex: 1.pdf).
+    """
+    documents = detail.get("documents") or []
+    updated: List[Dict[str, Any]] = []
+    for doc in documents:
+        if not isinstance(doc, dict):
+            continue
+        file_path = str(doc.get("file_path") or "")
+        filename = _safe_filename(file_path) or str(doc.get("filename") or "")
+        raw_text = str(doc.get("raw_text") or "")
+        if not raw_text and file_path and os.path.exists(file_path):
+            try:
+                data = Path(file_path).read_bytes()
+                if filename.lower().endswith(".pdf"):
+                    raw_text = _extract_pdf_text(data)
+                else:
+                    try:
+                        raw_text = data.decode("utf-8")
+                    except Exception:
+                        raw_text = ""
+            except Exception:
+                raw_text = ""
+        document_type = doc.get("document_type") or doc.get("doc_type") or "uploaded"
+        # Improve doc type detection using raw text.
+        document_type = _infer_doc_type(filename, raw_text)
+        updated.append(
+            {
+                **doc,
+                "filename": filename or doc.get("filename"),
+                "raw_text": raw_text,
+                "document_type": document_type,
+                "doc_type": document_type,
+            }
+        )
+    detail["documents"] = updated
 
 
 async def _store_files(case_id: int, files: Optional[List[UploadFile]]) -> List[Dict[str, str]]:
@@ -379,7 +438,15 @@ async def _store_files(case_id: int, files: Optional[List[UploadFile]]) -> List[
         dest_path = dest_dir / filename
         data = await file.read()
         dest_path.write_bytes(data)
-        doc_type = _infer_doc_type(filename)
+        raw_text = ""
+        if filename.lower().endswith(".pdf"):
+            raw_text = _extract_pdf_text(data)
+        else:
+            try:
+                raw_text = data.decode("utf-8")
+            except Exception:
+                raw_text = ""
+        doc_type = _infer_doc_type(filename, raw_text)
         stored_documents.append(
             {
                 "file_path": str(dest_path),
@@ -387,6 +454,7 @@ async def _store_files(case_id: int, files: Optional[List[UploadFile]]) -> List[
                 "file_hash": hashlib.sha256(data).hexdigest(),
                 "filename": filename,
                 "doc_type": doc_type,
+                "raw_text": raw_text,
             }
         )
     return stored_documents
@@ -437,7 +505,7 @@ def login(body: LoginRequest):
 
     user = fetch_user_by_email(email)
     if not user or user.get("password_hash") != password:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise HTTPException(status_code=401, detail="Mot de passe incorrect")
 
     role_value = user.get("role")
     if role_value not in ("CLIENT", "BANKER"):
@@ -449,9 +517,16 @@ def login(body: LoginRequest):
     return LoginResponse(token=token, role=role, user_id=str(user_id))
 
 
+@router.post("/auth/logout")
+def logout(user: Dict = Depends(get_current_user)):
+    if (user.get("role") or "").lower() == "banker":
+        clear_agent_sessions_for_banker(int(user.get("user_id")))
+    return {"status": "ok"}
+
+
 # --- Client -------------------------------------------------------------------
 @router.post("/client/credit-requests", response_model=CreditRequest)
-def create_credit_request(body: CreditRequestCreate, user=Depends(get_current_user)):
+def create_credit_request(body: CreditRequestCreate, user=Depends(get_current_user), background_tasks: BackgroundTasks = None):
     _require_role(user, "client")
     payload_data = body.model_dump()
     documents_payloads = [
@@ -465,8 +540,11 @@ def create_credit_request(body: CreditRequestCreate, user=Depends(get_current_us
     case_id = int(created["case_id"])
     orchestration = run_orchestrator({**payload_data, "case_id": case_id, "user_id": user["user_id"]})
     save_orchestration(case_id, orchestration)
+    if sync_credit_case_to_qdrant and background_tasks is not None:
+        background_tasks.add_task(sync_credit_case_to_qdrant, case_id)
     banker_detail = fetch_case_detail(case_id)
     if banker_detail:
+        _hydrate_documents(banker_detail)
         _prime_agent_sessions(banker_detail)
     detail = fetch_case_detail_for_client(created["case_id"], user["user_id"])
     if not detail:
@@ -496,6 +574,7 @@ def create_credit_request(body: CreditRequestCreate, user=Depends(get_current_us
 @router.post("/client/credit-requests/upload", response_model=CreditRequest)
 async def create_credit_request_upload(
     user=Depends(get_current_user),
+    background_tasks: BackgroundTasks = None,
     payload: str = Form(...),
     files: Optional[List[UploadFile]] = File(default=None),
 ):
@@ -527,8 +606,11 @@ async def create_credit_request_upload(
         }
     orchestration = run_orchestrator({**payload_data, "case_id": case_id, "user_id": user["user_id"]})
     save_orchestration(case_id, orchestration)
+    if sync_credit_case_to_qdrant and background_tasks is not None:
+        background_tasks.add_task(sync_credit_case_to_qdrant, case_id)
     banker_detail = fetch_case_detail(case_id)
     if banker_detail:
+        _hydrate_documents(banker_detail)
         _prime_agent_sessions(banker_detail)
 
     detail = fetch_case_detail_for_client(created["case_id"], user["user_id"])
@@ -587,6 +669,7 @@ def get_credit_request(req_id: str, user=Depends(get_current_user)):
 async def resubmit_credit_request(
     req_id: str,
     user=Depends(get_current_user),
+    background_tasks: BackgroundTasks = None,
     payload: str = Form(...),
     files: Optional[List[UploadFile]] = File(default=None),
 ):
@@ -622,8 +705,11 @@ async def resubmit_credit_request(
 
     orchestration = run_orchestrator({**payload_data, "case_id": int(req_id), "user_id": user["user_id"]})
     save_orchestration(int(req_id), orchestration)
+    if sync_credit_case_to_qdrant and background_tasks is not None:
+        background_tasks.add_task(sync_credit_case_to_qdrant, int(req_id))
     banker_detail = fetch_case_detail(int(req_id))
     if banker_detail:
+        _hydrate_documents(banker_detail)
         _prime_agent_sessions(banker_detail)
 
     detail = fetch_case_detail_for_client(int(req_id), user["user_id"])
@@ -702,6 +788,7 @@ def get_request_detail(req_id: str, user: Dict = Depends(get_current_user)):
     detail = fetch_case_detail(int(req_id))
     if not detail:
         raise HTTPException(status_code=404, detail="Credit request not found")
+    _hydrate_documents(detail)
     return _build_banker_request(detail)
 
 
@@ -733,6 +820,7 @@ def download_file(case_id: int, filename: str, user: Dict = Depends(get_current_
 async def upload_case_documents(
     req_id: str,
     user: Dict = Depends(get_current_user),
+    background_tasks: BackgroundTasks = None,
     files: Optional[List[UploadFile]] = File(default=None),
 ):
     _require_role(user, "banker")
@@ -748,9 +836,12 @@ async def upload_case_documents(
 
     refreshed = fetch_case_detail(int(req_id))
     if refreshed:
+        _hydrate_documents(refreshed)
         orchestration = run_orchestrator(refreshed)
         save_orchestration(int(req_id), orchestration)
-        _prime_agent_sessions(refreshed)
+        if sync_credit_case_to_qdrant and background_tasks is not None:
+            background_tasks.add_task(sync_credit_case_to_qdrant, int(req_id))
+        _prime_agent_sessions(refreshed, int(user.get("user_id")))
 
     final_detail = fetch_case_detail(int(req_id))
     if not final_detail:
@@ -759,12 +850,48 @@ async def upload_case_documents(
 
 
 @router.post("/banker/credit-requests/{req_id}/decision")
-def submit_decision(req_id: str, body: DecisionCreate, user: Dict = Depends(get_current_user)):
+def submit_decision(req_id: str, body: DecisionCreate, user: Dict = Depends(get_current_user), background_tasks: BackgroundTasks = None):
     _require_role(user, "banker")
     decision_row = upsert_decision(int(req_id), body.decision, body.note, int(user.get("user_id")))
     if not decision_row:
         raise HTTPException(status_code=404, detail="Credit request not found")
+    if sync_credit_case_to_qdrant and background_tasks is not None:
+        background_tasks.add_task(sync_credit_case_to_qdrant, int(req_id))
     return {"status": _map_status("DECIDED", decision_row), "note": body.note}
+
+
+@router.post("/banker/credit-requests/{req_id}/payments", response_model=PaymentInfo)
+def create_payment(req_id: str, body: PaymentCreate, user: Dict = Depends(get_current_user), background_tasks: BackgroundTasks = None):
+    """
+    Record a payment for the case's loan, update payment_behavior_summary, and sync to Qdrant.
+
+    This is banker-only and best-effort; it is meant to simulate/record payments for the existing loan.
+    """
+    _require_role(user, "banker")
+    payment = create_payment_for_case(
+        int(req_id),
+        payment_date=body.payment_date,
+        amount=body.amount,
+        channel=body.channel,
+        status=body.status,
+        installment_id=body.installment_id,
+    )
+    if not payment:
+        raise HTTPException(status_code=400, detail="No loan found for this case (approve the case first)")
+    if sync_credit_case_to_qdrant and background_tasks is not None:
+        background_tasks.add_task(sync_credit_case_to_qdrant, int(req_id))
+    return PaymentInfo(
+        payment_id=int(payment["payment_id"]),
+        loan_id=int(payment["loan_id"]),
+        installment_id=payment.get("installment_id"),
+        payment_date=payment["payment_date"],
+        amount=float(payment["amount"]),
+        channel=str(payment["channel"]),
+        status=str(payment["status"]),
+        is_reversal=bool(payment["is_reversal"]),
+        reversal_of=payment.get("reversal_of"),
+        created_at=payment["created_at"],
+    )
 
 
 @router.post("/banker/credit-requests/{req_id}/comments")
@@ -781,7 +908,8 @@ def get_agent_chat(req_id: str, agent_name: str, user: Dict = Depends(get_curren
     if not detail:
         raise HTTPException(status_code=404, detail="Credit request not found")
     agent_name = agent_name.lower().strip()
-    session = get_agent_session(int(req_id), agent_name)
+    banker_id = int(user.get("user_id"))
+    session = get_agent_session(int(req_id), agent_name, banker_id)
     snapshot = session.get("snapshot_json") if session else _build_chat_snapshot(detail)
     messages_payload = (session.get("messages_json") or []) if session else []
     messages: List[AgentChatMessage] = [
@@ -796,7 +924,7 @@ def get_agent_chat(req_id: str, agent_name: str, user: Dict = Depends(get_curren
             created_at=datetime.now(timezone.utc),
         )
         messages = [initial_message]
-        upsert_agent_session(int(req_id), agent_name, snapshot, [m.model_dump() for m in messages])
+        upsert_agent_session(int(req_id), agent_name, snapshot, [m.model_dump() for m in messages], banker_id)
     return AgentChatResponse(agent_name=agent_name, messages=messages)
 
 
@@ -811,7 +939,8 @@ def post_agent_chat(req_id: str, body: AgentChatRequest, user: Dict = Depends(ge
     if not agent_name:
         raise HTTPException(status_code=400, detail="agent_name is required")
 
-    session = get_agent_session(int(req_id), agent_name)
+    banker_id = int(user.get("user_id"))
+    session = get_agent_session(int(req_id), agent_name, banker_id)
     if session:
         messages_payload = session.get("messages_json") or []
         snapshot = session.get("snapshot_json") or _build_chat_snapshot(detail)
@@ -847,20 +976,23 @@ def post_agent_chat(req_id: str, body: AgentChatRequest, user: Dict = Depends(ge
     if len(messages) > 50:
         messages = messages[-50:]
 
-    upsert_agent_session(int(req_id), agent_name, snapshot, [m.model_dump() for m in messages])
+    upsert_agent_session(int(req_id), agent_name, snapshot, [m.model_dump() for m in messages], banker_id)
     return AgentChatResponse(agent_name=agent_name, messages=messages)
 
 
 @router.post("/banker/credit-requests/{req_id}/rerun")
-def rerun_agents(req_id: str, _: Dict = Depends(get_current_user)):
+def rerun_agents(req_id: str, user: Dict = Depends(get_current_user), background_tasks: BackgroundTasks = None):
     detail = fetch_case_detail(int(req_id))
     if not detail:
         raise HTTPException(status_code=404, detail="Credit request not found")
     result = run_orchestrator(detail)
     save_orchestration(int(req_id), result)
+    if sync_credit_case_to_qdrant and background_tasks is not None:
+        background_tasks.add_task(sync_credit_case_to_qdrant, int(req_id))
     refreshed = fetch_case_detail(int(req_id))
     if refreshed:
-        _prime_agent_sessions(refreshed)
+        _hydrate_documents(refreshed)
+        _prime_agent_sessions(refreshed, int(user.get("user_id")))
     agents = result.get("agents") or None
     return {"status": "ok", "agents": agents}
 

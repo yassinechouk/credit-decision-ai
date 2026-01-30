@@ -5,6 +5,8 @@ Refactorisé avec LangChain & LangGraph
 
 import os
 import json
+import time
+import threading
 from pathlib import Path
 from typing import Dict, Any, List, Optional, TypedDict, Tuple
 from dataclasses import dataclass, asdict
@@ -39,6 +41,124 @@ QDRANT_AUTO_LOAD = os.getenv("QDRANT_AUTO_LOAD", "0") == "1"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.groq.com/openai/v1")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
+
+try:
+    QDRANT_TIMEOUT_SEC = float(os.getenv("QDRANT_TIMEOUT_SEC", "2.5"))
+except ValueError:
+    QDRANT_TIMEOUT_SEC = 2.5
+try:
+    QDRANT_RETRY_COUNT = int(os.getenv("QDRANT_RETRY_COUNT", "2"))
+except ValueError:
+    QDRANT_RETRY_COUNT = 2
+try:
+    EMBEDDING_TIMEOUT_SEC = float(os.getenv("EMBEDDING_TIMEOUT_SEC", "3.0"))
+except ValueError:
+    EMBEDDING_TIMEOUT_SEC = 3.0
+try:
+    EMBEDDING_RETRY_COUNT = int(os.getenv("EMBEDDING_RETRY_COUNT", "1"))
+except ValueError:
+    EMBEDDING_RETRY_COUNT = 1
+
+
+def _embed_with_timeout(embedder, text: str, timeout_sec: float) -> Optional[List[float]]:
+    result: Dict[str, Any] = {"value": None, "error": None}
+
+    def _run() -> None:
+        try:
+            result["value"] = embedder.embed_query(text)
+        except Exception as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout_sec)
+    if thread.is_alive():
+        return None
+    if result.get("error") is not None:
+        return None
+    return result.get("value")
+
+
+def _embed_with_retry(embedder, text: str, timeout_sec: float, retries: int) -> Optional[List[float]]:
+    attempts = max(1, retries + 1)
+    for attempt in range(attempts):
+        vector = _embed_with_timeout(embedder, text, timeout_sec)
+        if vector:
+            return vector
+        if attempt < attempts - 1:
+            time.sleep(0.1 * (attempt + 1))
+    return None
+
+"""
+QDRANT PAYLOAD SCHEMA (compatibilite "dataset actuel", sans changer les formulaires)
+
+Contexte:
+- Le projet charge `data/synthetic/credit_dataset.json` (records synthetiques).
+- SimilarityAgent stocke ces records dans Qdrant comme `payload`.
+- La collection supporte des vecteurs nommes (mini multi-vector): profile + payment.
+
+Objectif:
+- Definir un "schema" standard (champs attendus + types) pour rendre l'integration Qdrant
+  robuste (filtrage, maintenance, docs), sans casser l'existant.
+- Permettre des recherches par type de vecteur (vector_type).
+
+Champs attendus (issus du dataset actuel):
+- case_id (int)
+- loan_amount (float)
+- loan_duration (int)
+- monthly_income (float)
+- other_income (float)
+- monthly_charges (float)
+- employment_type (str)
+- contract_type (str)
+- seniority_years (int)
+- marital_status (str)
+- number_of_children (int)
+- spouse_employed (bool)
+- housing_status (str)
+- is_primary_holder (bool)
+- defaulted (bool)
+- fraud_flag (bool)
+
+Notes:
+- Pas de `product_type`, `late_count`, `client_id`, `status` ici car ils n'existent pas dans le dataset
+  et l'objectif est de ne rien changer cote formulaires.
+- Les champs payment (late_installments, etc.) sont optionnels si la source est Postgres.
+"""
+
+# Payload schema types are used to build Qdrant payload indexes (optional but helpful for future filters).
+QDRANT_CREDIT_CASE_PAYLOAD_SCHEMA: Dict[str, str] = {
+    "case_id": "integer",
+    # Present in Postgres-backed sync (optional for synthetic dataset).
+    "user_id": "integer",
+    "case_status": "keyword",
+    "loan_amount": "float",
+    "loan_duration": "integer",
+    "monthly_income": "float",
+    "other_income": "float",
+    "monthly_charges": "float",
+    "employment_type": "keyword",
+    "contract_type": "keyword",
+    "seniority_years": "integer",
+    "marital_status": "keyword",
+    "number_of_children": "integer",
+    "spouse_employed": "bool",
+    "housing_status": "keyword",
+    "is_primary_holder": "bool",
+    "defaulted": "bool",
+    "fraud_flag": "bool",
+    # Payment summary fields (optional).
+    "late_installments": "integer",
+    "missed_installments": "integer",
+    "on_time_rate": "float",
+    "avg_days_late": "float",
+    "max_days_late": "integer",
+    "last_payment_date": "datetime",
+    # Sync metadata (optional).
+    "updated_at": "datetime",
+    "synced_at": "datetime",
+    "loan_status": "keyword",
+}
 
 
 def _extract_payment_summary(request_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -135,6 +255,106 @@ def _format_payment_summary_for_prompt(summary: Optional[Dict[str, Any]]) -> str
         f"- Retard max: {max_days_late} jours\n"
         f"- Tranches manquees: {missed}\n"
     )
+
+
+def _build_payment_embedding_text(summary: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(summary, dict):
+        return ""
+    try:
+        on_time_rate = float(summary.get("on_time_rate") or 0)
+    except (TypeError, ValueError):
+        on_time_rate = 0.0
+    try:
+        late_installments = int(summary.get("late_installments") or 0)
+    except (TypeError, ValueError):
+        late_installments = 0
+    try:
+        missed_installments = int(summary.get("missed_installments") or 0)
+    except (TypeError, ValueError):
+        missed_installments = 0
+    try:
+        avg_days_late = float(summary.get("avg_days_late") or 0)
+    except (TypeError, ValueError):
+        avg_days_late = 0.0
+    try:
+        max_days_late = int(summary.get("max_days_late") or 0)
+    except (TypeError, ValueError):
+        max_days_late = 0
+    last_payment_date = summary.get("last_payment_date") or ""
+    return (
+        "Payment behavior summary: "
+        f"on_time_rate={round(on_time_rate, 4)}, "
+        f"late_installments={late_installments}, "
+        f"missed_installments={missed_installments}, "
+        f"avg_days_late={round(avg_days_late, 2)}, "
+        f"max_days_late={max_days_late}, "
+        f"last_payment_date={last_payment_date}"
+    )
+
+
+def _normalize_payload_credit_case(record: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalise "doucement" le payload avant upsert Qdrant:
+    - conserve les champs existants (compatibilite)
+    - force les champs "core" a etre presents si possible
+    - cast de types simples (int/float/bool/str) quand c'est safe
+    """
+    payload = dict(record or {})
+
+    # Ensure case_id is present in payload when possible (useful for display).
+    case_id = payload.get("case_id")
+    if case_id is not None:
+        try:
+            payload["case_id"] = int(case_id)
+        except Exception:
+            # Keep original if conversion fails.
+            pass
+
+    for k in ("loan_duration", "seniority_years", "number_of_children"):
+        if k in payload and payload[k] is not None:
+            try:
+                payload[k] = int(payload[k])
+            except Exception:
+                pass
+
+    for k in ("user_id", "late_installments", "missed_installments", "max_days_late"):
+        if k in payload and payload[k] is not None:
+            try:
+                payload[k] = int(payload[k])
+            except Exception:
+                pass
+
+    for k in ("loan_amount", "monthly_income", "other_income", "monthly_charges"):
+        if k in payload and payload[k] is not None:
+            try:
+                payload[k] = float(payload[k])
+            except Exception:
+                pass
+
+    for k in ("on_time_rate", "avg_days_late"):
+        if k in payload and payload[k] is not None:
+            try:
+                payload[k] = float(payload[k])
+            except Exception:
+                pass
+
+    for k in ("defaulted", "fraud_flag", "spouse_employed", "is_primary_holder"):
+        if k in payload and payload[k] is not None:
+            # Accept booleans and 0/1.
+            if isinstance(payload[k], bool):
+                continue
+            if str(payload[k]).strip() in ("0", "1"):
+                payload[k] = str(payload[k]).strip() == "1"
+
+    for k in ("employment_type", "contract_type", "marital_status", "housing_status"):
+        if k in payload and payload[k] is not None:
+            payload[k] = str(payload[k])
+
+    for k in ("case_status", "loan_status"):
+        if k in payload and payload[k] is not None:
+            payload[k] = str(payload[k])
+
+    return payload
 
 
 def _case_status(case: Dict[str, Any]) -> str:
@@ -409,6 +629,7 @@ class AgentState(TypedDict):
     profile: Optional[CreditProfile]  # Objet profil instancié
     profile_dict: Dict[str, Any]      # Profil formaté pour calculs
     query_vector: List[float]         # Embedding
+    query_vectors: Dict[str, List[float]]  # Multi-vector embeddings
     similar_cases: List[Dict]         # Résultats Qdrant
     stats: Dict[str, Any]             # Statistiques calculées
     ai_analysis: Dict[str, Any]       # Réponse du LLM
@@ -597,6 +818,42 @@ class SimilarityAgentAI:
         except Exception:
             return
         if exists:
+            # Collection exists: do not break existing deployments.
+            # Best-effort: warn if config looks inconsistent and ensure payload indexes.
+            try:
+                info = self.qdrant_client.get_collection(self.collection_name)
+                cfg = getattr(info, "config", None)
+                params = getattr(cfg, "params", None) if cfg else None
+                vectors = getattr(params, "vectors", None) if params else None
+                vector_params = None
+                if vectors is not None:
+                    # Single-vector collections may expose "default"; multi-vector uses named configs.
+                    vector_params = getattr(vectors, "default", None) if hasattr(vectors, "default") else None
+                    if vector_params is None:
+                        vector_params = getattr(vectors, "profile", None)
+                if vector_params is not None:
+                    expected_size = None
+                    if self.embedding_model:
+                        try:
+                            expected_size = len(self.embedding_model.embed_query("seed"))
+                        except Exception:
+                            expected_size = None
+                    actual_size = getattr(vector_params, "size", None)
+                    actual_distance = getattr(vector_params, "distance", None)
+                    if expected_size and actual_size and expected_size != actual_size:
+                        print(
+                            f"[WARN] Qdrant collection '{self.collection_name}' vector size mismatch: "
+                            f"expected={expected_size}, actual={actual_size}"
+                        )
+                    if actual_distance and str(actual_distance).lower() not in ("cosine", "distance.cosine"):
+                        print(
+                            f"[WARN] Qdrant collection '{self.collection_name}' distance is {actual_distance}, "
+                            "expected COSINE"
+                        )
+            except Exception:
+                pass
+
+            self._ensure_payload_indexes()
             return
         vector_size = 384
         if self.embedding_model:
@@ -605,15 +862,57 @@ class SimilarityAgentAI:
             except Exception:
                 vector_size = 384
         try:
-            from qdrant_client.http.models import VectorParams, Distance
+            from qdrant_client.http.models import VectorParams, Distance, HnswConfigDiff
 
             self.qdrant_client.create_collection(
                 collection_name=self.collection_name,
-                vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+                vectors_config={
+                    "profile": VectorParams(size=vector_size, distance=Distance.COSINE),
+                    "payment": VectorParams(size=vector_size, distance=Distance.COSINE),
+                },
+                on_disk_payload=True,
+                # Basic defaults (not aggressive); good enough for production and compatible with current queries.
+                hnsw_config=HnswConfigDiff(m=16, ef_construct=128),
             )
             print(f"Collection Qdrant creee: {self.collection_name}")
+            self._ensure_payload_indexes()
         except Exception as exc:
             print("Impossible de creer la collection Qdrant: " + str(exc))
+
+    def _ensure_payload_indexes(self) -> None:
+        """
+        Best-effort creation of payload indexes (types) for the documented credit_case schema.
+        Non-fatal: if index already exists or server rejects, we keep running.
+        """
+        if not self.qdrant_client:
+            return
+        try:
+            from qdrant_client.http.models import PayloadSchemaType
+        except Exception:
+            return
+
+        schema_map = {
+            "keyword": PayloadSchemaType.KEYWORD,
+            "integer": PayloadSchemaType.INTEGER,
+            "float": PayloadSchemaType.FLOAT,
+            "bool": PayloadSchemaType.BOOL,
+            "datetime": PayloadSchemaType.DATETIME,
+            "text": PayloadSchemaType.TEXT,
+            "uuid": PayloadSchemaType.UUID,
+        }
+
+        for field_name, schema_type in QDRANT_CREDIT_CASE_PAYLOAD_SCHEMA.items():
+            qtype = schema_map.get(schema_type)
+            if not qtype:
+                continue
+            try:
+                self.qdrant_client.create_payload_index(
+                    collection_name=self.collection_name,
+                    field_name=field_name,
+                    field_schema=qtype,
+                )
+            except Exception:
+                continue
 
     def _load_dataset_into_qdrant_if_empty(self) -> None:
         if not self.qdrant_client or not self.embedding_model:
@@ -640,7 +939,16 @@ class SimilarityAgentAI:
                 vector = self.embedding_model.embed_query(text)
             except Exception:
                 continue
-            batch.append(PointStruct(id=record.get("case_id"), vector=vector, payload=record))
+            case_id = record.get("case_id")
+            if case_id is None:
+                continue
+            try:
+                point_id = int(case_id)
+            except Exception:
+                # Qdrant point IDs must be int/uuid/string; keep safe.
+                point_id = str(case_id)
+            payload = _normalize_payload_credit_case(record)
+            batch.append(PointStruct(id=point_id, vector={"profile": vector}, payload=payload))
             if len(batch) >= 100:
                 self.qdrant_client.upsert(collection_name=self.collection_name, points=batch)
                 batch = []
@@ -790,54 +1098,155 @@ class SimilarityAgentAI:
         if profile is None:
             raise ValueError("Profil manquant pour la generation d'embedding")
 
-        text_to_embed = profile.to_text()
+        profile_text = profile.to_text()
+        payment_summary = _extract_payment_summary(state.get("request_data") or {})
+        payment_text = _build_payment_embedding_text(payment_summary)
+
         if not self.embedding_model:
             print("   Embedding indisponible, fallback sans vecteur")
-            return {"query_vector": []}
+            return {"query_vector": [], "query_vectors": {}}
 
         # Utilisation de LangChain Embeddings
-        query_vector = self.embedding_model.embed_query(text_to_embed)
-        
-        print("   Embedding genere: " + str(len(query_vector)) + " dimensions")
-        return {"query_vector": query_vector}
+        query_vectors: Dict[str, List[float]] = {}
+        profile_vector = _embed_with_retry(self.embedding_model, profile_text, EMBEDDING_TIMEOUT_SEC, EMBEDDING_RETRY_COUNT)
+        if not profile_vector:
+            print("   Embedding profile indisponible, fallback sans vecteur")
+            return {"query_vector": [], "query_vectors": {}}
+        query_vectors["profile"] = profile_vector
+        if payment_text:
+            payment_vector = _embed_with_retry(self.embedding_model, payment_text, EMBEDDING_TIMEOUT_SEC, EMBEDDING_RETRY_COUNT)
+            if payment_vector:
+                query_vectors["payment"] = payment_vector
+
+        print("   Embedding profile genere: " + str(len(profile_vector)) + " dimensions")
+        return {"query_vector": profile_vector, "query_vectors": query_vectors}
 
     def node_search_similar(self, state: AgentState) -> Dict:
         """Etape 3: Recherche Qdrant"""
         print("")
         print("Etape 3/5: Recherche des " + str(self.top_k) + " cas similaires...")
         
-        query_vector = state.get("query_vector", [])
+        request_data = state.get("request_data") or {}
+        vector_type = str(request_data.get("vector_type") or "profile").lower()
+        query_vectors = state.get("query_vectors") or {}
+        query_vector = query_vectors.get(vector_type) or query_vectors.get("profile") or state.get("query_vector", [])
+        using_vector = vector_type if vector_type in query_vectors else "profile"
         profile_dict = state.get("profile_dict") or {}
         similar_cases: List[Dict[str, Any]] = []
         if not self.qdrant_client or not query_vector:
             print("   Qdrant ou embedding indisponible, aucun cas similaire recherche")
             points = []
         else:
-            try:
-                results = self.qdrant_client.query_points(
-                    collection_name=self.collection_name,
-                    query=query_vector,
-                    limit=self.top_k,
-                    with_payload=True
-                )
-                points = results.points if hasattr(results, "points") else results
-            except Exception as e:
-                print("Erreur Qdrant: " + str(e))
-                if hasattr(self.qdrant_client, "search"):
+            def _query_vector(name: str, vector: List[float]) -> List[Any]:
+                if not vector:
+                    return []
+                attempts = max(1, QDRANT_RETRY_COUNT + 1)
+                for attempt in range(attempts):
                     try:
-                        results = self.qdrant_client.search(
+                        results = self.qdrant_client.query_points(
                             collection_name=self.collection_name,
-                            query_vector=query_vector,
+                            query=vector,
+                            using=name,
                             limit=self.top_k,
                             with_payload=True,
+                            timeout=QDRANT_TIMEOUT_SEC,
                         )
-                        points = results if isinstance(results, list) else getattr(results, "points", [])
-                        print("   Fallback Qdrant: search() utilise")
-                    except Exception as search_exc:
-                        print("Erreur Qdrant search: " + str(search_exc))
-                        points = []
+                        return results.points if hasattr(results, "points") else results
+                    except Exception:
+                        if attempt < attempts - 1:
+                            time.sleep(0.1 * (attempt + 1))
+                        continue
+                return []
+
+            if vector_type in {"hybrid", "profile+payment", "profile_payment"}:
+                profile_vector = query_vectors.get("profile") or state.get("query_vector", [])
+                payment_vector = query_vectors.get("payment")
+
+                profile_points = _query_vector("profile", profile_vector)
+                payment_points = _query_vector("payment", payment_vector or [])
+
+                # If payment vector missing, fallback to profile only.
+                if not payment_points:
+                    points = profile_points
                 else:
+                    profile_weight = float(request_data.get("profile_weight", 0.6))
+                    payment_weight = float(request_data.get("payment_weight", 0.4))
+                    combined: Dict[Any, Dict[str, Any]] = {}
+
+                    def _ingest(points_list: List[Any], weight: float):
+                        for result in points_list:
+                            if hasattr(result, "payload"):
+                                payload = getattr(result, "payload", {}) or {}
+                                score = float(getattr(result, "score", 0) or 0)
+                            elif isinstance(result, dict):
+                                payload = result.get("payload", {}) or {}
+                                score = float(result.get("score", 0) or 0)
+                            else:
+                                payload = {}
+                                score = 0.0
+                            case_id = payload.get("case_id")
+                            if case_id is None:
+                                continue
+                            entry = combined.setdefault(
+                                case_id,
+                                {"payload": payload, "score": 0.0},
+                            )
+                            entry["score"] += weight * score
+
+                    _ingest(profile_points, profile_weight)
+                    _ingest(payment_points, payment_weight)
                     points = []
+                    for case_id, entry in combined.items():
+                        points.append({"payload": entry["payload"], "score": entry["score"]})
+                    points.sort(key=lambda x: x.get("score", 0), reverse=True)
+                    points = points[: self.top_k]
+            else:
+                try:
+                    results = self.qdrant_client.query_points(
+                        collection_name=self.collection_name,
+                        query=query_vector,
+                        using=using_vector,
+                        limit=self.top_k,
+                        with_payload=True,
+                        timeout=QDRANT_TIMEOUT_SEC,
+                    )
+                    points = results.points if hasattr(results, "points") else results
+                except Exception as e:
+                    # Retry with profile vector if a specific vector name fails.
+                    if using_vector != "profile":
+                        try:
+                            results = self.qdrant_client.query_points(
+                                collection_name=self.collection_name,
+                                query=query_vectors.get("profile") or query_vector,
+                                using="profile",
+                                limit=self.top_k,
+                                with_payload=True,
+                                timeout=QDRANT_TIMEOUT_SEC,
+                            )
+                            points = results.points if hasattr(results, "points") else results
+                            print("   Fallback Qdrant: using=profile")
+                        except Exception as e2:
+                            print("Erreur Qdrant: " + str(e2))
+                            points = []
+                    else:
+                        print("Erreur Qdrant: " + str(e))
+                    if hasattr(self.qdrant_client, "search"):
+                        try:
+                            results = self.qdrant_client.search(
+                                collection_name=self.collection_name,
+                                query_vector=query_vector,
+                                limit=self.top_k,
+                                with_payload=True,
+                                using=using_vector,
+                                timeout=QDRANT_TIMEOUT_SEC,
+                            )
+                            points = results if isinstance(results, list) else getattr(results, "points", [])
+                            print("   Fallback Qdrant: search() utilise")
+                        except Exception as search_exc:
+                            print("Erreur Qdrant search: " + str(search_exc))
+                            points = []
+                    else:
+                        points = []
         
         for result in points:
             if hasattr(result, "payload"):

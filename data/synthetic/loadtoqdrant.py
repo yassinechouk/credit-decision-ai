@@ -8,22 +8,22 @@ from qdrant_client.http.models import (
 from sentence_transformers import SentenceTransformer
 import json
 import numpy as np
+import os
 
 # ============================================
 # 1. CONNEXION AU CLUSTER QDRANT
 # ============================================
 
-# Option A:  Qdrant Cloud (recommandé pour production)
-client = QdrantClient(
-    url="https://44775a69-b58f-449f-b5ca-b0f6ec6b5862.europe-west3-0.gcp.cloud.qdrant.io:6333", 
-    api_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.51Eobf7Ye3tWtM_4YRPqCtAAvPXIssDAJbgm3KHx9ic",
-)
+QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
+COLLECTION_NAME = os.getenv("QDRANT_COLLECTION_NAME", "credit_dataset")
+
+client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
 # ============================================
 # 2. CRÉER UNE COLLECTION
 # ============================================
 
-COLLECTION_NAME = "credit_dataset"
 VECTOR_SIZE = 384  # Taille du modèle all-MiniLM-L6-v2
 
 # Supprimer la collection si elle existe
@@ -33,13 +33,44 @@ if client.collection_exists(COLLECTION_NAME):
 # Créer la collection
 client.create_collection(
     collection_name=COLLECTION_NAME,
-    vectors_config=VectorParams(
-        size=VECTOR_SIZE,
-        distance=Distance.COSINE  # ou EUCLID, DOT
-    )
+    vectors_config={
+        "profile": VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
+        "payment": VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
+    },
+    on_disk_payload=True,
 )
 
 print(f"✅ Collection '{COLLECTION_NAME}' créée")
+
+# Indexes payload (best-effort) to match the documented schema used by SimilarityAgentAI.
+payload_schema = {
+    "case_id": PayloadSchemaType.INTEGER,
+    "loan_amount": PayloadSchemaType.FLOAT,
+    "loan_duration": PayloadSchemaType.INTEGER,
+    "monthly_income": PayloadSchemaType.FLOAT,
+    "other_income": PayloadSchemaType.FLOAT,
+    "monthly_charges": PayloadSchemaType.FLOAT,
+    "employment_type": PayloadSchemaType.KEYWORD,
+    "contract_type": PayloadSchemaType.KEYWORD,
+    "seniority_years": PayloadSchemaType.INTEGER,
+    "marital_status": PayloadSchemaType.KEYWORD,
+    "number_of_children": PayloadSchemaType.INTEGER,
+    "spouse_employed": PayloadSchemaType.BOOL,
+    "housing_status": PayloadSchemaType.KEYWORD,
+    "is_primary_holder": PayloadSchemaType.BOOL,
+    "defaulted": PayloadSchemaType.BOOL,
+    "fraud_flag": PayloadSchemaType.BOOL,
+}
+
+for field_name, field_schema in payload_schema.items():
+    try:
+        client.create_payload_index(
+            collection_name=COLLECTION_NAME,
+            field_name=field_name,
+            field_schema=field_schema,
+        )
+    except Exception:
+        pass
 
 # ============================================
 # 3. CHARGER LE MODÈLE D'EMBEDDING
@@ -78,7 +109,11 @@ def record_to_text(record:  dict) -> str:
 # ============================================
 
 # Charger le fichier JSON
-with open('/workspaces/credit-decision-ai/data/synthetic/credit_dataset.json', 'r') as f:
+dataset_path = os.getenv(
+    "SIMILARITY_DATASET_PATH",
+    "/workspaces/credit-decision-ai/data/synthetic/credit_dataset.json",
+)
+with open(dataset_path, 'r') as f:
     credit_data = json.load(f)
 
 # Préparer les points pour Qdrant
@@ -94,7 +129,7 @@ for record in credit_data:
     # Créer le point Qdrant
     point = PointStruct(
         id=record['case_id'],
-        vector=vector,
+        vector={"profile": vector},
         payload={
             "case_id": record['case_id'],
             "loan_amount":  record['loan_amount'],

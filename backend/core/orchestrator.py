@@ -28,6 +28,11 @@ except Exception:  # pragma: no cover
     explain_decision = None  # type: ignore
 
 try:
+    from agents.decision_agent import make_decision_payload as make_decision_payload  # type: ignore
+except Exception:  # pragma: no cover
+    make_decision_payload = None  # type: ignore
+
+try:
     from agents.orchestrator import orchestrate_decision  # type: ignore
 except Exception:  # pragma: no cover
     orchestrate_decision = None  # type: ignore
@@ -627,13 +632,60 @@ def run_orchestrator(request_data: Dict[str, Any]) -> Dict[str, Any]:
         confidence = 0.0
 
     reason_codes = _derive_reason_codes(request_data, doc_result, behavior_result, sim_result, fraud_result, image_result)
+
+    decision_agent_raw: Dict[str, Any] = {}
+    if make_decision_payload:
+        try:
+            decision_agent_raw = make_decision_payload(
+                doc_result,
+                sim_result,
+                behavior_result=behavior_result,
+                payment_summary=payment_summary,
+                fraud_result=fraud_result,
+                image_result=image_result,
+                orchestrator_output=orchestrator_output,
+                reason_codes=reason_codes,
+                case_id=str(case_id),
+            )
+        except Exception:
+            decision_agent_raw = {}
+
+    decision_choice = decision_agent_raw.get("decision") or proposed
+    decision_label = _normalize_decision_label(str(decision_choice))
+    decision_confidence = decision_agent_raw.get("decision_confidence", decision_agent_raw.get("confidence", confidence))
+    try:
+        decision_confidence = float(decision_confidence)
+    except (TypeError, ValueError):
+        decision_confidence = confidence
+    if decision_confidence < 0:
+        decision_confidence = 0.0
+    if decision_confidence > 1:
+        decision_confidence = 1.0
+
+    human_review_required = decision_agent_raw.get("human_review_required")
+    if not isinstance(human_review_required, bool):
+        human_review_required = orchestrator_output.get("human_review_required", True)
+
+    decision_reason_codes = decision_agent_raw.get("reason_codes")
+    if not isinstance(decision_reason_codes, list):
+        decision_reason_codes = reason_codes
+
     decision_payload = {
         "case_id": case_id,
-        "decision": _normalize_decision_label(str(proposed)),
-        "decision_raw": proposed,
-        "reason_codes": reason_codes,
-        "decision_confidence": confidence,
-        "human_review_required": orchestrator_output.get("human_review_required", True),
+        "decision": decision_label,
+        "decision_raw": decision_agent_raw.get("decision_raw", decision_choice),
+        "reason_codes": decision_reason_codes,
+        "decision_confidence": round(decision_confidence, 4),
+        "human_review_required": human_review_required,
+    }
+    if isinstance(decision_agent_raw.get("summary"), str):
+        decision_payload["summary"] = decision_agent_raw.get("summary")
+
+    agent_results["decision_agent"] = decision_agent_raw or {
+        "decision": decision_payload.get("decision"),
+        "decision_confidence": decision_payload.get("decision_confidence"),
+        "reason_codes": decision_payload.get("reason_codes"),
+        "human_review_required": decision_payload.get("human_review_required"),
     }
 
     if explain_decision:
@@ -663,7 +715,8 @@ def run_orchestrator(request_data: Dict[str, Any]) -> Dict[str, Any]:
     if customer_summary:
         summary = customer_summary
     else:
-        reasons = ", ".join(reason_codes) if reason_codes else "aucun signal majeur"
+        final_reasons = decision_payload.get("reason_codes") or reason_codes
+        reasons = ", ".join(final_reasons) if final_reasons else "aucun signal majeur"
         summary = f"Decision proposee: {decision_payload['decision']} | Raisons: {reasons}"
 
     return {
